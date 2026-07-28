@@ -252,8 +252,10 @@ inline at::Tensor nvl_dist_map(
         access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         CUCHECK(cuMemSetAccess(chunk_va, chunk_allocated_size, &access, 1));
 
-        CUCHECK(cuMemRelease(mem_handle));
+        // Release exactly once. A failed driver call may report an earlier
+        // asynchronous error, so retrying this opaque handle is not safe.
         mem_handle_owned = false;
+        CUCHECK(cuMemRelease(mem_handle));
     }
 
     std::vector<int64_t> full_shape = chunk_shape;
