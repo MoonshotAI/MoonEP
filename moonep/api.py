@@ -394,6 +394,7 @@ def _create_context(
         'num_sms_dedup': num_sms_dedup,
         'token_padding': token_padding,
         'device': device,
+        '_plan_context_marker': object(),
         'token_padding_extra': token_padding_extra,
         # NVLink shared
         'hidden_buf': hidden_buf,
@@ -585,6 +586,40 @@ class Buffer:
             plan.dup_counts,
         )
 
+    @staticmethod
+    def _validate_plan(
+        ctx: dict,
+        plan: MoonEPCommPlan,
+        operation: str,
+    ) -> None:
+        if not isinstance(plan, MoonEPCommPlan):
+            raise TypeError(f"{operation}: plan must be a MoonEPCommPlan")
+
+        if plan._context_marker is not ctx['_plan_context_marker']:
+            raise ValueError(
+                f"{operation}: plan was created by a different Buffer; "
+                "reuse it only with the Buffer that produced it"
+            )
+
+        expected = {
+            'N': int(ctx['N']),
+            'R': int(ctx['R']),
+            'E': int(ctx['E']),
+            'B': int(ctx['B']),
+            'NvS': int(ctx['NvS']),
+            'K': int(ctx['K']),
+        }
+        mismatches = [
+            f"{name}: expected {value}, got {int(getattr(plan, name))}"
+            for name, value in expected.items()
+            if int(getattr(plan, name)) != value
+        ]
+        if mismatches:
+            raise ValueError(
+                f"{operation}: plan configuration does not match its Buffer "
+                f"({'; '.join(mismatches)})"
+            )
+
     def _run_dispatch_on_current_stream(
         self,
         ctx: dict,
@@ -750,7 +785,7 @@ class Buffer:
         else:
             cu_seqlens = None
             planning_args = None
-            assert isinstance(plan, MoonEPCommPlan)
+            self._validate_plan(ctx, plan, "Buffer.dispatch")
 
         if zero_copy:
             hidden_nvsh = ctx['hidden_buf_local']
@@ -844,7 +879,7 @@ class Buffer:
         """
         ctx = self._require_ctx()
 
-        assert isinstance(plan, MoonEPCommPlan), "Buffer.prefetch_weight: plan is required"
+        self._validate_plan(ctx, plan, "Buffer.prefetch_weight")
         weight_prefetch_args = (full_gate_weight, full_up_weight, full_down_weight)
         assert all(w is not None for w in weight_prefetch_args), \
             "prefetch_weight tensors must be provided together"
@@ -923,7 +958,7 @@ class Buffer:
         """
         ctx = self._require_ctx()
 
-        assert isinstance(plan, MoonEPCommPlan), "Buffer.combine: plan is required"
+        self._validate_plan(ctx, plan, "Buffer.combine")
 
         assert hidden_nvsh is not None
         assert hidden_nvsh.dtype == torch.bfloat16
@@ -1054,7 +1089,7 @@ class Buffer:
         )
         assert all(t is not None for t in grad_reduce_args), \
             "reduce_grad tensors must be provided together"
-        assert isinstance(plan, MoonEPCommPlan), "Buffer.reduce_grad: plan is required"
+        self._validate_plan(ctx, plan, "Buffer.reduce_grad")
 
         if not async_finish:
             self._run_reduce_grad_on_current_stream(

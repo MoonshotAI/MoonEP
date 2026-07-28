@@ -425,6 +425,54 @@ def test_dispatch_saved_plan_hidden_only_reuses_dst_and_skips_weights(dist_env):
     )
 
 
+def test_buffer_plan_provenance_rejects_foreign_and_incompatible_plans(
+    dist_env, monkeypatch
+):
+    from moonep.planning import allocate_planning_outputs
+
+    rank, R = dist_env
+    case = KernelCase(
+        "plan_provenance",
+        S=1,
+        K=1,
+        epn=1,
+        H=8,
+        num_sms=1,
+        B=1,
+        token_padding=1,
+        min_R=2,
+    )
+    ctx_a = init_case(case, R)
+    ctx_b = init_case(case, R)
+    buffer_a = ctx_a["_buffer"]
+    plan_a, _ = allocate_planning_outputs(ctx_a)
+    plan_b, _ = allocate_planning_outputs(ctx_b)
+    hidden = torch.empty(
+        case.S, case.H, dtype=torch.bfloat16, device=f"cuda:{rank}"
+    )
+
+    launches = []
+
+    def record_launch(*args, **kwargs):
+        launches.append((args, kwargs))
+
+    monkeypatch.setattr(buffer_a, "_run_dispatch_on_current_stream", record_launch)
+
+    _, _, cu_seqlens, accepted = buffer_a.dispatch(hidden, plan=plan_a.clone())
+    assert accepted._context_marker is plan_a._context_marker
+    assert cu_seqlens is None
+    assert len(launches) == 1
+
+    with pytest.raises(ValueError, match="created by a different Buffer"):
+        buffer_a.dispatch(hidden, plan=plan_b)
+    assert len(launches) == 1
+
+    incompatible = replace(plan_a, K=plan_a.K + 1)
+    with pytest.raises(ValueError, match=r"K: expected 1, got 2"):
+        buffer_a.dispatch(hidden, plan=incompatible)
+    assert len(launches) == 1
+
+
 @pytest.mark.parametrize("case", case_params(LARGE_DISPATCH_CASES))
 def test_dispatch_large_hidden_stride_spotcheck(dist_env, case):
     rank, R = dist_env

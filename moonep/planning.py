@@ -11,7 +11,7 @@ barrier on the NVLink meta_buf.
 """
 
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import cuda.bindings.driver as cuda
@@ -48,6 +48,7 @@ class MoonEPCommPlan:
     dup_groups: torch.Tensor
     dup_loffs: torch.Tensor
     dup_counts: torch.Tensor
+    _context_marker: object | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         N = int(self.N)
@@ -85,6 +86,7 @@ class MoonEPCommPlan:
             B=self.B,
             NvS=self.NvS,
             K=self.K,
+            _context_marker=self._context_marker,
         )
 
 
@@ -1246,6 +1248,7 @@ def allocate_planning_outputs(ctx: dict):
         B=B,
         NvS=NvS,
         K=K,
+        _context_marker=ctx.get('_plan_context_marker'),
     )
     return plan, cu_seqlens
 
