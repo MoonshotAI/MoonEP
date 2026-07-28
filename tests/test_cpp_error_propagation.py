@@ -5,18 +5,24 @@ import sys
 import textwrap
 
 
-def test_invalid_vmm_handle_raises_without_terminating_process():
+def test_non_cuda_posix_fd_raises_without_terminating_process():
     """A driver error must be catchable instead of calling exit()."""
     script = textwrap.dedent(
         """
-        from moonep._C import nvl_release_mem_handle
+        import os
 
+        from moonep._C import nvl_multicast_import
+
+        fd = os.open(os.devnull, os.O_RDONLY)
         try:
-            nvl_release_mem_handle(-1)
-        except RuntimeError as error:
-            assert "CUDA driver call `cuMemRelease" in str(error), str(error)
-        else:
-            raise AssertionError("invalid CUDA allocation handle was accepted")
+            try:
+                nvl_multicast_import(fd)
+            except RuntimeError as error:
+                assert "cuMemImportFromShareableHandle" in str(error), str(error)
+            else:
+                raise AssertionError("non-CUDA POSIX fd was accepted")
+        finally:
+            os.close(fd)
 
         print("process continued after CUDA driver error")
         """
