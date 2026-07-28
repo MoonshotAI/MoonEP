@@ -241,10 +241,25 @@ def _create_context(
                                   non-negative entries encode src_rank * NvS + offv,
                                   -1 marks empty slots
     """
+    if num_sms is not None:
+        if not isinstance(num_sms, int) or isinstance(num_sms, bool):
+            raise TypeError(
+                f"num_sms must be a positive int, got "
+                f"{type(num_sms).__name__}"
+            )
+        if num_sms <= 0:
+            raise ValueError(f"num_sms must be a positive int, got {num_sms}")
+
+    device = torch.cuda.current_device()
+    max_sms = torch.cuda.get_device_properties(device).multi_processor_count
     if num_sms is None:
-        num_sms = 32
-    assert isinstance(num_sms, int) and num_sms > 0, \
-        f"num_sms must be a positive int, got {num_sms}"
+        num_sms = min(32, max_sms)
+    if num_sms > max_sms:
+        raise ValueError(
+            f"num_sms ({num_sms}) must not exceed the device SM count "
+            f"({max_sms})"
+        )
+
     rank = dist.get_rank(group=group)
     R = num_ep_ranks
     assert R == dist.get_world_size(group=group), (
@@ -252,9 +267,7 @@ def _create_context(
         f"({dist.get_world_size(group=group)})"
     )
     N = S * K
-    device = torch.cuda.current_device()
     dev = f"cuda:{device}"
-    max_sms = torch.cuda.get_device_properties(device).multi_processor_count
     num_sms_dedup = _num_sms_dedup_from_env(max_sms)
 
     epn = E // R
@@ -460,7 +473,9 @@ class Buffer:
             E: total routed experts in the EP group; must be divisible by
                 ``num_ep_ranks``.
             num_ep_ranks: EP group size (R); must equal the group world size.
-            num_sms: SM count for the comm kernels; None defaults to 32.
+            num_sms: SM count for the comm kernels; must not exceed the
+                current CUDA device's SM count. None defaults to the smaller
+                of 32 and the device SM count.
             token_padding: each non-empty VM group is padded up to a multiple
                 of this token count.
             B: weight prefetch slots per rank; None defaults to
