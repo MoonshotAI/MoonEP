@@ -358,11 +358,11 @@ def test_combine_rejects_bad_inputs(dist_env):
 
     with pytest.raises(TypeError, match="hidden_sh"):
         buffer.combine(hidden_sh=output, plan=plan, hidden_nvsh=hidden_user)
-    with pytest.raises(AssertionError, match="plan is required"):
+    with pytest.raises(TypeError, match="plan must be a MoonEPCommPlan"):
         buffer.combine(hidden_nvsh=hidden_user)
-    with pytest.raises(AssertionError):
+    with pytest.raises(TypeError, match="hidden_nvsh"):
         buffer.combine(plan=plan)
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="route_weights_nvs must have shape"):
         buffer.combine(
             plan=plan,
             hidden_nvsh=hidden_user,

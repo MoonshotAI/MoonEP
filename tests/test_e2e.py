@@ -201,15 +201,19 @@ def assert_grad_reduced(rank, R, E, H, Hp, experts_to_copy, args, offsets):
                     ), f"{name} non-local reduce slot ({src_rank}, {b}) changed"
 
 
-def assert_raises_assertion(expected_substr, fn):
+def assert_raises(expected_type, expected_substr, fn):
     try:
         fn()
-    except AssertionError as exc:
-        assert expected_substr in str(exc), (
-            f"expected assertion containing {expected_substr!r}, got {exc!r}"
-        )
+    except expected_type as exc:
+        if expected_substr not in str(exc):
+            raise AssertionError(
+                f"expected {expected_type.__name__} containing "
+                f"{expected_substr!r}, got {exc!r}"
+            ) from exc
     else:
-        raise AssertionError(f"expected AssertionError containing {expected_substr!r}")
+        raise AssertionError(
+            f"expected {expected_type.__name__} containing {expected_substr!r}"
+        )
 
 
 def test_e2e():
@@ -237,6 +241,15 @@ def test_e2e():
     # Snapshot the plan's tensors so a later dispatch can't mutate them.
     assert isinstance(plan_sync, MoonEPCommPlan)
     plan_snapshot = plan_sync.clone()
+    bad_prefetch_args = dict(sync_prefetch_args)
+    bad_prefetch_args["full_gate_weight"] = (
+        bad_prefetch_args["full_gate_weight"].view(torch.int16)
+    )
+    assert_raises(
+        TypeError,
+        "full_gate_weight must have dtype",
+        lambda: buffer.prefetch_weight(plan=plan_snapshot, **bad_prefetch_args),
+    )
     buffer.prefetch_weight(plan=plan_snapshot, **sync_prefetch_args)
     torch.cuda.synchronize()
     assert_prefetched(sync_prefetch_args, plan_snapshot.experts_to_copy[rank])
@@ -361,7 +374,8 @@ def test_e2e():
     assert torch.equal(out_sync_snap, out_zc), "zero_copy combine hidden mismatch"
     assert torch.equal(gathered_weights_zc, weights), \
         "zero_copy combine route_weights_sk gather mismatch"
-    assert_raises_assertion(
+    assert_raises(
+        ValueError,
         "alias",
         lambda: buffer.combine(
             plan=plan_zc,
@@ -376,6 +390,15 @@ def test_e2e():
     )
     grad_offsets = (1000.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0)
     grad_args = make_grad_reduce_args(rank, R, E, B, H, Hp, grad_offsets)
+    bad_grad_args = dict(grad_args)
+    bad_grad_args["full_gate_grad"] = bad_grad_args["full_gate_grad"].view(
+        torch.int32
+    )
+    assert_raises(
+        TypeError,
+        "full_gate_grad must have dtype",
+        lambda: buffer.reduce_grad(plan=plan_snapshot, **bad_grad_args),
+    )
     out_grad_sync, _, _ = buffer.combine(
         plan=plan_snapshot,
         hidden_nvsh=h_for_combine,

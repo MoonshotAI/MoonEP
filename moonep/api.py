@@ -79,6 +79,45 @@ def _align_up(x: int, alignment: int) -> int:
     return ((x + alignment - 1) // alignment) * alignment
 
 
+def _require_positive_int(name: str, value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} must be a positive int, got {type(value).__name__}")
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive int, got {value}")
+    return value
+
+
+def _require_tensor(
+    name: str,
+    tensor: object,
+    *,
+    dtype: torch.dtype,
+    shape: tuple[int | None, ...],
+    device: torch.device,
+    contiguous: bool = True,
+) -> torch.Tensor:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tensor.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
+    actual_shape = tuple(tensor.shape)
+    if len(actual_shape) != len(shape) or any(
+        expected is not None and actual != expected
+        for actual, expected in zip(actual_shape, shape)
+    ):
+        expected_shape = tuple("*" if dim is None else dim for dim in shape)
+        raise ValueError(
+            f"{name} must have shape {expected_shape}, got {actual_shape}"
+        )
+    if contiguous and not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    if not tensor.is_cuda:
+        raise ValueError(f"{name} must be a CUDA tensor")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    return tensor
+
+
 def _num_sms_dedup_from_env(max_sms: int) -> int:
     """Resolve the local epilogue/prologue SM count.
 
@@ -247,10 +286,11 @@ def _create_context(
         f"num_sms must be a positive int, got {num_sms}"
     rank = dist.get_rank(group=group)
     R = num_ep_ranks
-    assert R == dist.get_world_size(group=group), (
-        f"num_ep_ranks ({R}) must equal group world size "
-        f"({dist.get_world_size(group=group)})"
-    )
+    world_size = dist.get_world_size(group=group)
+    if R != world_size:
+        raise ValueError(
+            f"num_ep_ranks ({R}) must equal group world size ({world_size})"
+        )
     N = S * K
     device = torch.cuda.current_device()
     dev = f"cuda:{device}"
@@ -258,12 +298,12 @@ def _create_context(
     num_sms_dedup = _num_sms_dedup_from_env(max_sms)
 
     epn = E // R
-    assert E % R == 0, f"E ({E}) must be divisible by R ({R})"
-    assert isinstance(token_padding, int) and token_padding > 0, \
-        f"token_padding must be a positive int, got {token_padding}"
+    if E % R != 0:
+        raise ValueError(f"E ({E}) must be divisible by R ({R})")
+    _require_positive_int("token_padding", token_padding)
     if B is None:
         B = epn
-    assert isinstance(B, int) and B > 0, f"B must be a positive int, got {B}"
+    _require_positive_int("B", B)
 
     NvS_capacity = S * K
 
@@ -284,10 +324,11 @@ def _create_context(
     BLOCK_SIZE_P2 = 2048
 
     int32_max = 2**31 - 1
-    assert 0 < N < int32_max, (
-        "planning requires 0 < S*K < int32_max: "
-        f"S={S}, K={K}, S*K={N}, int32_max={int32_max}"
-    )
+    if not 0 < N < int32_max:
+        raise ValueError(
+            "planning requires 0 < S*K < int32_max: "
+            f"S={S}, K={K}, S*K={N}, int32_max={int32_max}"
+        )
     num_vblocks = (N + BLOCK_SIZE_P2 - 1) // BLOCK_SIZE_P2
 
     # ================================================================
@@ -300,9 +341,10 @@ def _create_context(
     TPE_OFF = _align_up(NvS, 4)
     PLAN_OFF = _align_up(TPE_OFF + R * E, 4)
     broadcast_elems = 3 * E * R
-    assert broadcast_elems % 4 == 0, (
-        f"broadcast_elems ({broadcast_elems}) must be divisible by 4"
-    )
+    if broadcast_elems % 4 != 0:
+        raise ValueError(
+            f"broadcast_elems ({broadcast_elems}) must be divisible by 4"
+        )
     planning_out_elems = (
         broadcast_elems
         + R * (E + B)
@@ -333,18 +375,20 @@ def _create_context(
     # Some CuTe DSL address expressions multiply a runtime Int32 rank/drank by
     # these constexpr strides, so guard the largest reachable nonnegative index.
     max_meta_index = (R - 1) * meta_chunk_padded + meta_chunk_logical - 1
-    assert max_meta_index <= int32_max, (
-        "meta_buf rank-stride indexing would overflow CuTe Int32 arithmetic: "
-        f"max_index={max_meta_index}, R={R}, S={S}, K={K}, N={N}, "
-        f"NvS={NvS}, meta_chunk_logical={meta_chunk_logical}, "
-        f"meta_chunk_padded={meta_chunk_padded}, int32_max={int32_max}"
-    )
+    if max_meta_index > int32_max:
+        raise ValueError(
+            "meta_buf rank-stride indexing would overflow CuTe Int32 arithmetic: "
+            f"max_index={max_meta_index}, R={R}, S={S}, K={K}, N={N}, "
+            f"NvS={NvS}, meta_chunk_logical={meta_chunk_logical}, "
+            f"meta_chunk_padded={meta_chunk_padded}, int32_max={int32_max}"
+        )
     max_hidden_index = (R - 1) * NvS_padded + NvS - 1
-    assert max_hidden_index <= int32_max, (
-        "hidden_buf/dst rank-stride indexing would overflow CuTe Int32 arithmetic: "
-        f"max_index={max_hidden_index}, R={R}, S={S}, K={K}, N={N}, "
-        f"NvS={NvS}, NvS_padded={NvS_padded}, int32_max={int32_max}"
-    )
+    if max_hidden_index > int32_max:
+        raise ValueError(
+            "hidden_buf/dst rank-stride indexing would overflow CuTe Int32 arithmetic: "
+            f"max_index={max_hidden_index}, R={R}, S={S}, K={K}, N={N}, "
+            f"NvS={NvS}, NvS_padded={NvS_padded}, int32_max={int32_max}"
+        )
 
     # ================================================================
     # Allocate NVLink shared buffers
@@ -474,13 +518,17 @@ class Buffer:
             explicitly_destroy: if True, warn (instead of auto-destroying)
                 when the Buffer is garbage-collected without ``destroy()``.
         """
-        assert isinstance(comm_stream_priority, int), (
-            f"comm_stream_priority must be an int, got "
-            f"{type(comm_stream_priority).__name__}"
-        )
-        assert isinstance(enable_pdl, bool), (
-            f"enable_pdl must be a bool, got {type(enable_pdl).__name__}"
-        )
+        if not isinstance(comm_stream_priority, int) or isinstance(
+            comm_stream_priority, bool
+        ):
+            raise TypeError(
+                "comm_stream_priority must be an int, got "
+                f"{type(comm_stream_priority).__name__}"
+            )
+        if not isinstance(enable_pdl, bool):
+            raise TypeError(
+                f"enable_pdl must be a bool, got {type(enable_pdl).__name__}"
+            )
         self.explicitly_destroy = explicitly_destroy
         self.comm_stream_priority = comm_stream_priority
         self.enable_pdl = enable_pdl
@@ -503,8 +551,10 @@ class Buffer:
         return self._destroyed
 
     def _require_ctx(self) -> dict:
-        assert not self._destroyed, "MoonEP Buffer has been destroyed"
-        assert self._ctx is not None, "MoonEP Buffer is not initialized"
+        if self._destroyed:
+            raise RuntimeError("MoonEP Buffer has been destroyed")
+        if self._ctx is None:
+            raise RuntimeError("MoonEP Buffer is not initialized")
         return self._ctx
 
     def destroy(self) -> None:
@@ -738,19 +788,52 @@ class Buffer:
               backward passes.
         """
         ctx = self._require_ctx()
+        device = torch.device("cuda", int(ctx['device']))
+        _require_tensor(
+            "hidden_sh",
+            hidden_sh,
+            dtype=torch.bfloat16,
+            shape=(int(ctx['S']), int(ctx['H'])),
+            device=device,
+        )
+        if route_weights_sk is not None:
+            _require_tensor(
+                "route_weights_sk",
+                route_weights_sk,
+                dtype=torch.float32,
+                shape=(int(ctx['S']), int(ctx['K'])),
+                device=device,
+            )
 
         if plan is None:
-            assert topk_experts_sk is not None and tokens_per_expert is not None
+            if topk_experts_sk is None or tokens_per_expert is None:
+                raise ValueError(
+                    "topk_experts_sk and tokens_per_expert are required when "
+                    "plan is not provided"
+                )
+            topk_experts_sk = _require_tensor(
+                "topk_experts_sk",
+                topk_experts_sk,
+                dtype=torch.int32,
+                shape=(int(ctx['S']), int(ctx['K'])),
+                device=device,
+                contiguous=False,
+            )
+            tokens_per_expert = _require_tensor(
+                "tokens_per_expert",
+                tokens_per_expert,
+                dtype=torch.int32,
+                shape=(int(ctx['E']),),
+                device=device,
+            )
             topk_flat = topk_experts_sk.reshape(-1)
-            assert topk_flat.dtype == torch.int32 and topk_flat.numel() == int(ctx['N'])
-            assert tokens_per_expert.dtype == torch.int32
-            assert tokens_per_expert.numel() == int(ctx['E']) and tokens_per_expert.is_contiguous()
             plan, cu_seqlens = allocate_planning_outputs(ctx)
             planning_args = (topk_flat, tokens_per_expert, cu_seqlens)
         else:
             cu_seqlens = None
             planning_args = None
-            assert isinstance(plan, MoonEPCommPlan)
+            if not isinstance(plan, MoonEPCommPlan):
+                raise TypeError("plan must be a MoonEPCommPlan")
 
         if zero_copy:
             hidden_nvsh = ctx['hidden_buf_local']
@@ -844,13 +927,23 @@ class Buffer:
         """
         ctx = self._require_ctx()
 
-        assert isinstance(plan, MoonEPCommPlan), "Buffer.prefetch_weight: plan is required"
+        if not isinstance(plan, MoonEPCommPlan):
+            raise TypeError("Buffer.prefetch_weight: plan must be a MoonEPCommPlan")
         weight_prefetch_args = (full_gate_weight, full_up_weight, full_down_weight)
-        assert all(w is not None for w in weight_prefetch_args), \
-            "prefetch_weight tensors must be provided together"
-        for w in weight_prefetch_args:
-            assert w.dtype == torch.bfloat16 and w.is_contiguous()
-            assert w.ndim == 3 and int(w.shape[0]) == int(ctx['E']) + int(ctx['B'])
+        if any(w is None for w in weight_prefetch_args):
+            raise ValueError("prefetch_weight tensors must be provided together")
+        device = torch.device("cuda", int(ctx['device']))
+        for name, weight in zip(
+            ("full_gate_weight", "full_up_weight", "full_down_weight"),
+            weight_prefetch_args,
+        ):
+            _require_tensor(
+                name,
+                weight,
+                dtype=torch.bfloat16,
+                shape=(int(ctx['E']) + int(ctx['B']), None, None),
+                device=device,
+            )
 
         if not async_finish:
             self._run_prefetch_weight_on_current_stream(
@@ -923,27 +1016,40 @@ class Buffer:
         """
         ctx = self._require_ctx()
 
-        assert isinstance(plan, MoonEPCommPlan), "Buffer.combine: plan is required"
+        if not isinstance(plan, MoonEPCommPlan):
+            raise TypeError("Buffer.combine: plan must be a MoonEPCommPlan")
 
-        assert hidden_nvsh is not None
-        assert hidden_nvsh.dtype == torch.bfloat16
-        assert hidden_nvsh.is_contiguous()
-        assert tuple(hidden_nvsh.shape) == (int(ctx['NvS']), int(ctx['H']))
+        device = torch.device("cuda", int(ctx['device']))
+        hidden_nvsh = _require_tensor(
+            "hidden_nvsh",
+            hidden_nvsh,
+            dtype=torch.bfloat16,
+            shape=(int(ctx['NvS']), int(ctx['H'])),
+            device=device,
+        )
         if route_weights_nvs is not None:
-            assert route_weights_nvs.dtype == torch.float32
-            assert route_weights_nvs.is_contiguous()
-            assert tuple(route_weights_nvs.shape) == (int(ctx['NvS']),)
-        if zero_copy:
-            assert hidden_nvsh.data_ptr() == ctx['hidden_buf_local'].data_ptr(), (
-                "combine(zero_copy=True): hidden_nvsh must alias the NVL shard "
-                "view returned by dispatch(zero_copy=True)"
+            _require_tensor(
+                "route_weights_nvs",
+                route_weights_nvs,
+                dtype=torch.float32,
+                shape=(int(ctx['NvS']),),
+                device=device,
             )
-            if route_weights_nvs is not None:
-                assert route_weights_nvs.data_ptr() == \
-                    ctx['weights_buf_local'].data_ptr(), (
-                    "combine(zero_copy=True): route_weights_nvs must alias "
-                    "the NVL weights view returned by dispatch(zero_copy=True)"
+        if zero_copy:
+            if hidden_nvsh.data_ptr() != ctx['hidden_buf_local'].data_ptr():
+                raise ValueError(
+                    "combine(zero_copy=True): hidden_nvsh must alias the NVL "
+                    "shard view returned by dispatch(zero_copy=True)"
                 )
+            if route_weights_nvs is not None:
+                if (
+                    route_weights_nvs.data_ptr()
+                    != ctx['weights_buf_local'].data_ptr()
+                ):
+                    raise ValueError(
+                        "combine(zero_copy=True): route_weights_nvs must alias "
+                        "the NVL weights view returned by dispatch(zero_copy=True)"
+                    )
 
         hidden_sh = torch.empty(
             int(ctx['S']),
@@ -1052,9 +1158,37 @@ class Buffer:
             up_reduce_buffer,
             down_reduce_buffer,
         )
-        assert all(t is not None for t in grad_reduce_args), \
-            "reduce_grad tensors must be provided together"
-        assert isinstance(plan, MoonEPCommPlan), "Buffer.reduce_grad: plan is required"
+        if any(t is None for t in grad_reduce_args):
+            raise ValueError("reduce_grad tensors must be provided together")
+        if not isinstance(plan, MoonEPCommPlan):
+            raise TypeError("Buffer.reduce_grad: plan must be a MoonEPCommPlan")
+
+        device = torch.device("cuda", int(ctx['device']))
+        for name, full_grad, reduce_buffer in (
+            ("gate", full_gate_grad, gate_reduce_buffer),
+            ("up", full_up_grad, up_reduce_buffer),
+            ("down", full_down_grad, down_reduce_buffer),
+        ):
+            full_grad = _require_tensor(
+                f"full_{name}_grad",
+                full_grad,
+                dtype=torch.float32,
+                shape=(int(ctx['E']) + int(ctx['B']), None, None),
+                device=device,
+            )
+            reduce_buffer = _require_tensor(
+                f"{name}_reduce_buffer",
+                reduce_buffer,
+                dtype=torch.float32,
+                shape=(int(ctx['R']), int(ctx['B']), None, None),
+                device=device,
+            )
+            if tuple(reduce_buffer.shape[2:]) != tuple(full_grad.shape[1:]):
+                raise ValueError(
+                    f"{name}_reduce_buffer shape {tuple(reduce_buffer.shape)} "
+                    f"is incompatible with full_{name}_grad shape "
+                    f"{tuple(full_grad.shape)}"
+                )
 
         if not async_finish:
             self._run_reduce_grad_on_current_stream(

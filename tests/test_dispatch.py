@@ -458,11 +458,27 @@ def test_dispatch_rejects_bad_inputs(dist_env):
     rank, R = dist_env
     case = KernelCase("bad_inputs", S=4, K=2, epn=2, H=8, num_sms=1, token_padding=1)
     ctx = init_case(case, R)
+    buffer = ctx["_buffer"]
     topk, tpe = make_topk(case, rank, R)
     hidden = _traceable_hidden(rank, case.S, case.H)
     weights = torch.rand(case.S, case.K, dtype=torch.float32, device=f"cuda:{rank}")
     plan, _cu = allocate_planning_outputs(ctx)
     launch_planning(ctx, topk.reshape(-1).contiguous(), tpe, _cu, plan)
+
+    with pytest.raises(TypeError, match="hidden_sh must have dtype"):
+        buffer.dispatch(hidden.float(), plan=plan)
+    with pytest.raises(ValueError, match="hidden_sh must be a CUDA tensor"):
+        buffer.dispatch(hidden.cpu(), plan=plan)
+    with pytest.raises(ValueError, match="route_weights_sk must have shape"):
+        buffer.dispatch(
+            hidden,
+            weights[:, : case.K - 1].contiguous(),
+            plan=plan,
+        )
+    with pytest.raises(TypeError, match="topk_experts_sk must have dtype"):
+        buffer.dispatch(hidden, weights, topk.long(), tpe)
+    with pytest.raises(ValueError, match="tokens_per_expert must be a CUDA tensor"):
+        buffer.dispatch(hidden, weights, topk, tpe.cpu())
 
     with pytest.raises(AssertionError, match="hidden_sh"):
         launch_dispatch(ctx, hidden.float(), weights, plan, build_dedup_map=True)
