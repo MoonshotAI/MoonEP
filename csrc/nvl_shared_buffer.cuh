@@ -426,8 +426,6 @@ inline at::Tensor nvl_multicast_bind_map(
     int64_t mc_handle_u64, int64_t owned_mem_handle_u64,
     int64_t size_bytes, int64_t num_devices
 ) {
-    int device_id;
-    CUDACHECK(cudaGetDevice(&device_id));
     // Ownership transfers here: _create_nvl_multicast_view has no outer
     // release for the created/imported multicast handle. On success the
     // returned tensor's deleter releases it; this guard covers failure.
@@ -439,6 +437,8 @@ inline at::Tensor nvl_multicast_bind_map(
     CUmemGenericAllocationHandle mem_handle =
         static_cast<CUmemGenericAllocationHandle>(owned_mem_handle_u64);
     bool mc_handle_owned = true;
+    CUdevice cu_device = 0;
+    bool mem_bound = false;
     CUdeviceptr mc_va = 0;
     bool va_reserved = false;
     bool va_mapped = false;
@@ -449,10 +449,19 @@ inline at::Tensor nvl_multicast_bind_map(
         if (va_reserved) {
             cuMemAddressFree(mc_va, static_cast<size_t>(size_bytes));
         }
+        if (mem_bound) {
+            cuMulticastUnbind(
+                mc_handle, cu_device, /*mcOffset=*/0,
+                static_cast<size_t>(size_bytes));
+        }
         if (mc_handle_owned) {
             cuMemRelease(mc_handle);
         }
     });
+
+    int device_id;
+    CUDACHECK(cudaGetDevice(&device_id));
+    CUCHECK(cuDeviceGet(&cu_device, device_id));
 
     const size_t gran = nvl_multicast_granularity(static_cast<int>(num_devices));
     TORCH_CHECK(static_cast<size_t>(size_bytes) % gran == 0,
@@ -463,6 +472,7 @@ inline at::Tensor nvl_multicast_bind_map(
     // Bind this rank's owned physical allocation to offset 0 of the multicast object.
     CUCHECK(cuMulticastBindMem(
         mc_handle, /*mcOffset=*/0, mem_handle, /*memOffset=*/0, size, 0));
+    mem_bound = true;
 
     // Reserve a separate VA for the multicast handle and map it. Pass 0 for
     // alignment (the driver aligns to granularity by default, same as
@@ -496,6 +506,7 @@ inline at::Tensor nvl_multicast_bind_map(
         c10::Device(c10::kCUDA, device_id));
     va_mapped = false;
     va_reserved = false;
+    mem_bound = false;
     mc_handle_owned = false;
     auto storage = c10::Storage(
         c10::Storage::use_byte_size_t(),
