@@ -53,7 +53,8 @@ PYBIND11_MODULE(_C, m) {
           pybind11::arg("size_bytes"), pybind11::arg("num_devices"),
           "Bind the local chunk's owned physical memory (nvl_dist_alloc handle) "
           "to the multicast object and map a multicast VA; returns a keepalive "
-          "int32 tensor whose data_ptr is the multimem address.");
+          "int32 tensor whose data_ptr is the multimem address. Consumes "
+          "mc_handle and borrows owned_mem_handle.");
     m.def("nvl_release_mem_handle", &nvl_release_mem_handle,
           pybind11::arg("mem_handle"),
           "Release an owned mem handle returned by nvl_dist_alloc.");

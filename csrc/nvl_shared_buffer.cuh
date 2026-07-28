@@ -1,39 +1,41 @@
 #pragma once
 
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <tuple>
 #include <vector>
+
+#include <unistd.h>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/util/ScopeExit.h>
 
 #ifndef CUCHECK
-#define CUCHECK(cmd) do {                                      \
-    CUresult err = cmd;                                            \
-    if (err != CUDA_SUCCESS) {                                     \
-        const char *errStr;                                        \
-        cuGetErrorString(err, &errStr);                            \
-        fprintf(stderr, "Failed: CUDA error %s:%d '%s'\n",        \
-            __FILE__, __LINE__, errStr);                           \
-        exit(EXIT_FAILURE);                                        \
-    }                                                              \
+#define CUCHECK(cmd) do {                                                   \
+    const CUresult err = (cmd);                                             \
+    if (err != CUDA_SUCCESS) {                                              \
+        const char *err_name = nullptr;                                     \
+        const char *err_string = nullptr;                                   \
+        cuGetErrorName(err, &err_name);                                     \
+        cuGetErrorString(err, &err_string);                                 \
+        TORCH_CHECK(false, "CUDA driver call `", #cmd, "` failed with ",   \
+            err_name ? err_name : "unknown error", " (code ",              \
+            static_cast<int>(err), "): ",                                  \
+            err_string ? err_string : "unknown error");                    \
+    }                                                                       \
 } while(0)
 #endif
 
 #ifndef CUDACHECK
-#define CUDACHECK(cmd) do {                                    \
-    cudaError_t err = cmd;                                         \
-    if (err != cudaSuccess) {                                      \
-        fprintf(stderr, "Failed: CUDA error %s:%d '%s'\n",        \
-            __FILE__, __LINE__, cudaGetErrorString(err));          \
-        exit(EXIT_FAILURE);                                        \
-    }                                                              \
+#define CUDACHECK(cmd) do {                                                \
+    const cudaError_t err = (cmd);                                         \
+    TORCH_CHECK(err == cudaSuccess, "CUDA runtime call `", #cmd,          \
+        "` failed with ", cudaGetErrorName(err), " (code ",               \
+        static_cast<int>(err), "): ", cudaGetErrorString(err));            \
 } while(0)
 #endif
 
@@ -66,36 +68,18 @@ static inline std::tuple<size_t, size_t, int> nvl_prepare(
     return {size, allocated_size, device_id};
 }
 
-static inline at::Tensor make_vmm_tensor(
-    void *ptr,
-    size_t nbytes,
-    size_t allocated_size,
+static inline auto make_vmm_deleter(
     int device_id,
-    const std::vector<int64_t> &shape,
-    at::ScalarType dtype
+    CUdeviceptr dptr,
+    size_t allocated_size
 ) {
-    auto deleter = [device_id, ptr, allocated_size](void *p) {
+    return [device_id, dptr, allocated_size](void *p) {
         if (!p) return;
         c10::cuda::CUDAGuard guard(device_id);
         cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream().stream());
-        cuMemUnmap(reinterpret_cast<CUdeviceptr>(ptr), allocated_size);
-        cuMemAddressFree(reinterpret_cast<CUdeviceptr>(ptr), allocated_size);
+        cuMemUnmap(dptr, allocated_size);
+        cuMemAddressFree(dptr, allocated_size);
     };
-
-    auto storage = c10::Storage(
-        c10::Storage::use_byte_size_t(),
-        static_cast<int64_t>(nbytes),
-        at::InefficientStdFunctionContext::makeDataPtr(
-            ptr, std::move(deleter), c10::Device(c10::kCUDA, device_id)),
-        /*allocator=*/nullptr,
-        /*resizable=*/false);
-
-    auto impl = c10::make_intrusive<at::TensorImpl>(
-        std::move(storage),
-        c10::DispatchKeySet(c10::DispatchKey::CUDA),
-        c10::scalarTypeToTypeMeta(dtype));
-    impl->set_sizes_contiguous(shape);
-    return at::Tensor(std::move(impl));
 }
 
 // Returns (keepalive VA tensor, exported POSIX fd, owned mem handle as int64).
@@ -117,12 +101,34 @@ inline std::tuple<at::Tensor, int64_t, int64_t> nvl_dist_alloc(
     prop.location.id = device_id;
     prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
 
-    CUmemGenericAllocationHandle mem_handle;
-    CUCHECK(cuMemCreate(&mem_handle, allocated_size, &prop, 0));
+    CUmemGenericAllocationHandle mem_handle = {};
+    bool mem_handle_owned = false;
+    CUdeviceptr dptr = 0;
+    bool va_reserved = false;
+    bool va_mapped = false;
+    int fd = -1;
+    auto cleanup = c10::make_scope_exit([&]() {
+        if (fd >= 0) {
+            close(fd);
+        }
+        if (va_mapped) {
+            cuMemUnmap(dptr, allocated_size);
+        }
+        if (va_reserved) {
+            cuMemAddressFree(dptr, allocated_size);
+        }
+        if (mem_handle_owned) {
+            cuMemRelease(mem_handle);
+        }
+    });
 
-    CUdeviceptr dptr;
+    CUCHECK(cuMemCreate(&mem_handle, allocated_size, &prop, 0));
+    mem_handle_owned = true;
+
     CUCHECK(cuMemAddressReserve(&dptr, allocated_size, 0, 0, 0));
+    va_reserved = true;
     CUCHECK(cuMemMap(dptr, allocated_size, 0, mem_handle, 0));
+    va_mapped = true;
 
     CUmemAccessDesc access_desc = {};
     access_desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -135,17 +141,39 @@ inline std::tuple<at::Tensor, int64_t, int64_t> nvl_dist_alloc(
     // caller is responsible for nvl_release_mem_handle. The physical memory is
     // referenced by the unicast map (keepalive) and (optionally) multicast;
     // it is only truly freed after all unmaps once the handle is released.
-    int fd = -1;
     CUCHECK(cuMemExportToShareableHandle(
         &fd, mem_handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
     TORCH_CHECK(fd >= 0, "cuMemExportToShareableHandle returned invalid fd");
 
-    auto keepalive = make_vmm_tensor(
-        reinterpret_cast<void *>(dptr), nbytes, allocated_size,
-        device_id, chunk_shape, dtype);
+    auto data_ptr = at::InefficientStdFunctionContext::makeDataPtr(
+        reinterpret_cast<void *>(dptr),
+        make_vmm_deleter(device_id, dptr, allocated_size),
+        c10::Device(c10::kCUDA, device_id));
 
-    return {std::move(keepalive), static_cast<int64_t>(fd),
-            static_cast<int64_t>(mem_handle)};
+    // data_ptr now owns the mapping and VA.
+    va_mapped = false;
+    va_reserved = false;
+    auto storage = c10::Storage(
+        c10::Storage::use_byte_size_t(),
+        static_cast<int64_t>(nbytes),
+        std::move(data_ptr),
+        /*allocator=*/nullptr,
+        /*resizable=*/false);
+    auto impl = c10::make_intrusive<at::TensorImpl>(
+        std::move(storage),
+        c10::DispatchKeySet(c10::DispatchKey::CUDA),
+        c10::scalarTypeToTypeMeta(dtype));
+    impl->set_sizes_contiguous(chunk_shape);
+    auto keepalive = at::Tensor(std::move(impl));
+
+    // Construct the complete return value before transferring the fd and
+    // allocation handle to the caller.
+    auto result = std::make_tuple(
+        std::move(keepalive), static_cast<int64_t>(fd),
+        static_cast<int64_t>(mem_handle));
+    fd = -1;
+    mem_handle_owned = false;
+    return result;
 }
 
 // Release the owned mem handle returned by nvl_dist_alloc (the physical memory
@@ -183,19 +211,39 @@ inline at::Tensor nvl_dist_map(
     size_t total_allocated_size = chunk_allocated_size * world_size;
     size_t total_nbytes = chunk_nbytes * world_size;
 
-    CUdeviceptr dptr;
+    CUdeviceptr dptr = 0;
+    bool va_reserved = false;
+    size_t mapped_chunks = 0;
+    auto cleanup = c10::make_scope_exit([&]() {
+        for (size_t i = 0; i < mapped_chunks; i++) {
+            cuMemUnmap(dptr + i * chunk_allocated_size, chunk_allocated_size);
+        }
+        if (va_reserved) {
+            cuMemAddressFree(dptr, total_allocated_size);
+        }
+    });
+
     CUCHECK(cuMemAddressReserve(&dptr, total_allocated_size, 0, 0, 0));
+    va_reserved = true;
 
     for (int64_t i = 0; i < world_size; i++) {
         int fd = static_cast<int>(fds[i]);
-        CUmemGenericAllocationHandle mem_handle;
+        CUmemGenericAllocationHandle mem_handle = {};
+        bool mem_handle_owned = false;
+        auto release_handle = c10::make_scope_exit([&]() {
+            if (mem_handle_owned) {
+                cuMemRelease(mem_handle);
+            }
+        });
         CUCHECK(cuMemImportFromShareableHandle(
             &mem_handle,
             reinterpret_cast<void *>(static_cast<intptr_t>(fd)),
             CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
+        mem_handle_owned = true;
 
         CUdeviceptr chunk_va = dptr + i * chunk_allocated_size;
         CUCHECK(cuMemMap(chunk_va, chunk_allocated_size, 0, mem_handle, 0));
+        mapped_chunks++;
 
         // All chunks get RW access for dispatch writes
         CUmemAccessDesc access = {};
@@ -205,6 +253,7 @@ inline at::Tensor nvl_dist_map(
         CUCHECK(cuMemSetAccess(chunk_va, chunk_allocated_size, &access, 1));
 
         CUCHECK(cuMemRelease(mem_handle));
+        mem_handle_owned = false;
     }
 
     std::vector<int64_t> full_shape = chunk_shape;
@@ -223,12 +272,14 @@ inline at::Tensor nvl_dist_map(
         cuMemAddressFree(dptr, tas);
     };
 
+    auto data_ptr = at::InefficientStdFunctionContext::makeDataPtr(
+        reinterpret_cast<void *>(dptr), std::move(deleter),
+        c10::Device(c10::kCUDA, device_id));
+    cleanup.release();
     auto storage = c10::Storage(
         c10::Storage::use_byte_size_t(),
         static_cast<int64_t>(total_nbytes),
-        at::InefficientStdFunctionContext::makeDataPtr(
-            reinterpret_cast<void *>(dptr), std::move(deleter),
-            c10::Device(c10::kCUDA, device_id)),
+        std::move(data_ptr),
         /*allocator=*/nullptr,
         /*resizable=*/false);
 
@@ -237,7 +288,8 @@ inline at::Tensor nvl_dist_map(
         c10::DispatchKeySet(c10::DispatchKey::CUDA),
         c10::scalarTypeToTypeMeta(dtype));
     impl->set_sizes_contiguous(full_shape);
-    return at::Tensor(std::move(impl));
+    auto result = at::Tensor(std::move(impl));
+    return result;
 }
 
 // ============================================================
@@ -315,15 +367,30 @@ inline std::tuple<int64_t, int64_t> nvl_multicast_create(
     prop.handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     prop.flags = 0;
 
-    CUmemGenericAllocationHandle mc_handle;
-    CUCHECK(cuMulticastCreate(&mc_handle, &prop));
-
+    CUmemGenericAllocationHandle mc_handle = {};
+    bool mc_handle_owned = false;
     int fd = -1;
+    auto cleanup = c10::make_scope_exit([&]() {
+        if (fd >= 0) {
+            close(fd);
+        }
+        if (mc_handle_owned) {
+            cuMemRelease(mc_handle);
+        }
+    });
+
+    CUCHECK(cuMulticastCreate(&mc_handle, &prop));
+    mc_handle_owned = true;
+
     CUCHECK(cuMemExportToShareableHandle(
         &fd, mc_handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
     TORCH_CHECK(fd >= 0, "cuMemExportToShareableHandle returned invalid fd");
 
-    return {static_cast<int64_t>(mc_handle), static_cast<int64_t>(fd)};
+    auto result = std::make_tuple(
+        static_cast<int64_t>(mc_handle), static_cast<int64_t>(fd));
+    mc_handle_owned = false;
+    fd = -1;
+    return result;
 }
 
 // non-root: import the multicast object from the POSIX fd sent by root. The
@@ -359,10 +426,31 @@ inline at::Tensor nvl_multicast_bind_map(
 ) {
     int device_id;
     CUDACHECK(cudaGetDevice(&device_id));
+    // Ownership transfers here: _create_nvl_multicast_view has no outer
+    // release for the created/imported multicast handle. On success the
+    // returned tensor's deleter releases it; this guard covers failure.
     CUmemGenericAllocationHandle mc_handle =
         static_cast<CUmemGenericAllocationHandle>(mc_handle_u64);
+    // Borrowed: create_nvl_dist_multicast_tensor separately releases the
+    // physical allocation handle in its outer finally block, including when
+    // this function throws.
     CUmemGenericAllocationHandle mem_handle =
         static_cast<CUmemGenericAllocationHandle>(owned_mem_handle_u64);
+    bool mc_handle_owned = true;
+    CUdeviceptr mc_va = 0;
+    bool va_reserved = false;
+    bool va_mapped = false;
+    auto cleanup = c10::make_scope_exit([&]() {
+        if (va_mapped) {
+            cuMemUnmap(mc_va, static_cast<size_t>(size_bytes));
+        }
+        if (va_reserved) {
+            cuMemAddressFree(mc_va, static_cast<size_t>(size_bytes));
+        }
+        if (mc_handle_owned) {
+            cuMemRelease(mc_handle);
+        }
+    });
 
     const size_t gran = nvl_multicast_granularity(static_cast<int>(num_devices));
     TORCH_CHECK(static_cast<size_t>(size_bytes) % gran == 0,
@@ -378,9 +466,10 @@ inline at::Tensor nvl_multicast_bind_map(
     // alignment (the driver aligns to granularity by default, same as
     // nvl_dist_alloc/nvl_dist_map; a non-zero alignment is rejected by
     // cuMemAddressReserve as invalid argument).
-    CUdeviceptr mc_va;
     CUCHECK(cuMemAddressReserve(&mc_va, size, 0, 0, 0));
+    va_reserved = true;
     CUCHECK(cuMemMap(mc_va, size, 0, mc_handle, 0));
+    va_mapped = true;
 
     CUmemAccessDesc access = {};
     access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -400,12 +489,16 @@ inline at::Tensor nvl_multicast_bind_map(
     };
 
     std::vector<int64_t> shape = {static_cast<int64_t>(size / sizeof(int32_t))};
+    auto data_ptr = at::InefficientStdFunctionContext::makeDataPtr(
+        reinterpret_cast<void*>(mc_va), std::move(deleter),
+        c10::Device(c10::kCUDA, device_id));
+    va_mapped = false;
+    va_reserved = false;
+    mc_handle_owned = false;
     auto storage = c10::Storage(
         c10::Storage::use_byte_size_t(),
         static_cast<int64_t>(size),
-        at::InefficientStdFunctionContext::makeDataPtr(
-            reinterpret_cast<void*>(mc_va), std::move(deleter),
-            c10::Device(c10::kCUDA, device_id)),
+        std::move(data_ptr),
         /*allocator=*/nullptr,
         /*resizable=*/false);
 
@@ -414,5 +507,6 @@ inline at::Tensor nvl_multicast_bind_map(
         c10::DispatchKeySet(c10::DispatchKey::CUDA),
         c10::scalarTypeToTypeMeta(at::kInt));
     impl->set_sizes_contiguous(shape);
-    return at::Tensor(std::move(impl));
+    auto result = at::Tensor(std::move(impl));
+    return result;
 }
