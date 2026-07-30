@@ -225,7 +225,7 @@ class MoonEPRunner:
         # Untimed full dispatch (public API): materializes the plan + dedup
         # structures used by saved-plan dispatch/combine below.
         _, _, _, self.plan = self.buffer.dispatch(
-            hidden, weights, topk, tpe, zero_copy=True)
+            hidden, weights, topk, tpe, zero_copy=True, router_weights_zero_copy=True)
         # Scratch plan for the separate (exact) planning measurement.
         self._launch_planning(self.ctx, self._topk_flat, tpe,
                               self.cu_seqlens, self.plan_scratch)
@@ -259,7 +259,8 @@ class MoonEPRunner:
         # full fwd (public API): inter_rank_sync + planning + dispatch +
         # epilogue (zero_copy, no boundary copy), then prefetch weight.
         _, _, _, self.plan = self.buffer.dispatch(
-            self.hidden, self.weights, self.topk, self.tpe, zero_copy=True)
+            self.hidden, self.weights, self.topk, self.tpe,
+            zero_copy=True, router_weights_zero_copy=True)
         self._prefetch()
 
     def dispatch_bwd(self):
@@ -278,7 +279,7 @@ class MoonEPRunner:
         # path and is not included in this benchmark.
         self.buffer.combine(plan=self.plan, hidden_nvsh=self.shard_view,
                             route_weights_nvs=self.weights_view,
-                            zero_copy=True)
+                            zero_copy=True, router_weights_zero_copy=True)
 
     def destroy(self):
         self.buffer.destroy()

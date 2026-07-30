@@ -344,7 +344,7 @@ def test_e2e():
     # identity on the shard, combine consumes the views in place. Must match
     # the zero_copy=False result bit-exactly.
     h_zc, w_zc, _, plan_zc = buffer.dispatch(
-        hidden, weights, topk, tpe, zero_copy=True,
+        hidden, weights, topk, tpe, zero_copy=True, router_weights_zero_copy=True,
     )
     assert h_zc.data_ptr() == buffer._require_ctx()['hidden_buf_local'].data_ptr(), \
         "dispatch(zero_copy=True) must return the NVL shard view"
@@ -357,6 +357,7 @@ def test_e2e():
         hidden_nvsh=h_zc,
         route_weights_nvs=w_zc,
         zero_copy=True,
+        router_weights_zero_copy=True,
     )
     torch.cuda.synchronize()
     assert torch.equal(out_sync_snap, out_zc), "zero_copy combine hidden mismatch"

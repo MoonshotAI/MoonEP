@@ -502,6 +502,26 @@ class Buffer:
     def destroyed(self) -> bool:
         return self._destroyed
 
+    @property
+    def hidden_nvsh_buffer_view(self) -> torch.Tensor:
+        """The local rank's [NvS, H] bf16 communication buffer.
+
+        Exposed for zero-copy integration: callers may write expert outputs
+        into this view and hand it back to ``combine(zero_copy=True)``. The
+        view aliases persistent comm state that every dispatch/combine on
+        this Buffer overwrites — never let it (or any tensor sharing its
+        storage) cross into autograd-saved state.
+        """
+        return self._require_ctx()['hidden_buf_local']
+
+    @property
+    def router_weight_buffer_view(self) -> torch.Tensor:
+        """fp32 view of the local rank's [NvS] route-weights comm buffer.
+
+        Same aliasing/lifetime rules as ``hidden_nvsh_buffer_view``.
+        """
+        return self._require_ctx()['weights_buf_local'].view(torch.float32)
+
     def _require_ctx(self) -> dict:
         assert not self._destroyed, "MoonEP Buffer has been destroyed"
         assert self._ctx is not None, "MoonEP Buffer is not initialized"
@@ -597,6 +617,7 @@ class Buffer:
         *,
         inter_rank_sync: bool,
         zero_copy: bool,
+        route_weights_zero_copy: bool,
     ) -> None:
         if inter_rank_sync:
             launch_inter_rank_sync(ctx)
@@ -621,13 +642,14 @@ class Buffer:
         # In-place duplicate expansion on the NVL shard: after this the shard
         # holds the full user-visible [NvS, H] layout.
         launch_dispatch_epilogue(ctx, plan, pdl_launch=self.enable_pdl)
+        # master-style boundary copies (same stream, plain SM copies), gated
+        # independently per output tensor.
         if not zero_copy:
-            # master-style boundary copies (same stream, plain SM copies).
             hidden_nvsh.copy_(ctx['hidden_buf_local'])
-            if route_weights_nvs is not None:
-                route_weights_nvs.copy_(
-                    ctx['weights_buf_local'].view(torch.float32)
-                )
+        if route_weights_nvs is not None and not route_weights_zero_copy:
+            route_weights_nvs.copy_(
+                ctx['weights_buf_local'].view(torch.float32)
+            )
 
     def _run_combine_on_current_stream(
         self,
@@ -640,18 +662,20 @@ class Buffer:
         *,
         inter_rank_sync: bool,
         zero_copy: bool,
+        router_weights_zero_copy: bool,
     ) -> None:
         # Pre-staging sync keeps its master-era position; combine's own entry
         # cross_rank_barrier publishes the staged + accumulated NVL writes.
         if inter_rank_sync:
             launch_inter_rank_sync(ctx)
+        # master-style boundary copies into the shard (same stream), gated
+        # independently per input tensor.
         if not zero_copy:
-            # master-style boundary copies into the shard (same stream).
             ctx['hidden_buf_local'].copy_(hidden_nvsh)
-            if route_weights_nvs is not None:
-                ctx['weights_buf_local'].copy_(
-                    route_weights_nvs.view(torch.int32)
-                )
+        if route_weights_nvs is not None and not router_weights_zero_copy:
+            ctx['weights_buf_local'].copy_(
+                route_weights_nvs.view(torch.int32)
+            )
         # In-place fp32 accumulation of duplicate rows into their primary.
         launch_combine_prologue(ctx, plan, pdl_trigger=self.enable_pdl)
         launch_combine(
@@ -693,6 +717,7 @@ class Buffer:
         *,
         inter_rank_sync: bool = True,
         zero_copy: bool = False,
+        router_weights_zero_copy: bool = False,
     ):
         """dispatch fwd: run planning (unless reusing a plan) and scatter tokens
         to their expert-grouped positions on remote ranks.
@@ -714,15 +739,21 @@ class Buffer:
                 the return value.
             inter_rank_sync: run a CuTe DSL rank sync before planning
                 (default True).
-            zero_copy: return views of the communication buffer
-                (``hidden_buf_local`` and the fp32 view of
-                ``weights_buf_local``) instead of fresh tensors. The views
-                alias state that the next dispatch/combine on this Buffer
-                overwrites, so callers must not keep them across communication
-                calls (in particular autograd must not save them for backward
+            zero_copy: return a view of the communication buffer
+                (``hidden_buf_local``) instead of a fresh tensor. The view
+                aliases state that the next dispatch/combine on this Buffer
+                overwrites, so callers must not keep it across communication
+                calls (in particular autograd must not save it for backward
                 — that is exactly the case that requires ``zero_copy=False``).
                 Row content is only defined within the ``cu_seqlens``-covered
                 padded segments.
+            router_weights_zero_copy: like ``zero_copy`` but for
+                ``route_weights_nvs`` (the fp32 view of ``weights_buf_local``).
+                Defaults to False even when ``zero_copy=True``: the weights
+                view is the dangerous special case (tiny tensor, commonly
+                saved into autograd state by training frameworks), so callers
+                that only consume it before the next dispatch — e.g.
+                inference — opt in explicitly.
 
         Returns:
             ``(hidden_nvsh, route_weights_nvs, cu_seqlens, plan)``, plus a
@@ -754,15 +785,15 @@ class Buffer:
 
         if zero_copy:
             hidden_nvsh = ctx['hidden_buf_local']
-            route_weights_nvs = (
-                ctx['weights_buf_local'].view(torch.float32)
-                if route_weights_sk is not None else None
-            )
         else:
             hidden_nvsh = torch.empty_like(ctx['hidden_buf_local'])
-            route_weights_nvs = (
-                torch.empty(ctx['NvS'], dtype=torch.float32, device=ctx['meta_buf'].device)
-                if route_weights_sk is not None else None
+        if route_weights_sk is None:
+            route_weights_nvs = None
+        elif router_weights_zero_copy:
+            route_weights_nvs = ctx['weights_buf_local'].view(torch.float32)
+        else:
+            route_weights_nvs = torch.empty(
+                ctx['NvS'], dtype=torch.float32, device=ctx['meta_buf'].device
             )
 
         if not async_finish:
@@ -776,6 +807,7 @@ class Buffer:
                 route_weights_nvs,
                 inter_rank_sync=inter_rank_sync,
                 zero_copy=zero_copy,
+                route_weights_zero_copy=router_weights_zero_copy,
             )
             return hidden_nvsh, route_weights_nvs, cu_seqlens, plan
 
@@ -808,6 +840,7 @@ class Buffer:
                 route_weights_nvs,
                 inter_rank_sync=inter_rank_sync,
                 zero_copy=zero_copy,
+                route_weights_zero_copy=router_weights_zero_copy,
             )
             done = comm.record_event()
 
@@ -887,6 +920,7 @@ class Buffer:
         inter_rank_sync: bool = True,
         *,
         zero_copy: bool = False,
+        router_weights_zero_copy: bool = False,
     ):
         """combine fwd: gather expert outputs from the NVL buffer and K-sum
         back to token-major [S, H].
@@ -904,12 +938,15 @@ class Buffer:
             async_finish: run on the comm stream and return a CUDA event.
             inter_rank_sync: run a CuTe DSL rank sync before staging
                 (default True).
-            zero_copy: ``hidden_nvsh`` (and ``route_weights_nvs`` when given)
-                must be exactly the views returned by a ``zero_copy=True``
-                dispatch — the caller's FFN writes its output in place on the
-                shard and no boundary copy is performed (asserted via
-                ``data_ptr()``). With ``zero_copy=False`` the inputs are
-                ordinary tensors that are first copied into the shard.
+            zero_copy: ``hidden_nvsh`` must be exactly the view returned by a
+                ``zero_copy=True`` dispatch — the caller's FFN writes its
+                output in place on the shard and no boundary copy is performed
+                (asserted via ``data_ptr()``). With ``zero_copy=False`` the
+                input is an ordinary tensor that is first copied into the
+                shard.
+            router_weights_zero_copy: same contract for ``route_weights_nvs``
+                (the fp32 view of ``weights_buf_local``); default False, i.e.
+                an ordinary tensor that is copied into the shard first.
 
         Returns:
             ``(hidden_sh, route_weights_sk, event)``:
@@ -938,12 +975,13 @@ class Buffer:
                 "combine(zero_copy=True): hidden_nvsh must alias the NVL shard "
                 "view returned by dispatch(zero_copy=True)"
             )
-            if route_weights_nvs is not None:
-                assert route_weights_nvs.data_ptr() == \
-                    ctx['weights_buf_local'].data_ptr(), (
-                    "combine(zero_copy=True): route_weights_nvs must alias "
-                    "the NVL weights view returned by dispatch(zero_copy=True)"
-                )
+        if router_weights_zero_copy and route_weights_nvs is not None:
+            assert route_weights_nvs.data_ptr() == \
+                ctx['weights_buf_local'].data_ptr(), (
+                "combine(router_weights_zero_copy=True): route_weights_nvs must "
+                "alias the NVL weights view returned by "
+                "dispatch(router_weights_zero_copy=True)"
+            )
 
         hidden_sh = torch.empty(
             int(ctx['S']),
@@ -971,6 +1009,7 @@ class Buffer:
                 route_weights_sk,
                 inter_rank_sync=inter_rank_sync,
                 zero_copy=zero_copy,
+                router_weights_zero_copy=router_weights_zero_copy,
             )
             return hidden_sh, route_weights_sk, None
 
@@ -1001,6 +1040,7 @@ class Buffer:
                 route_weights_sk,
                 inter_rank_sync=inter_rank_sync,
                 zero_copy=zero_copy,
+                router_weights_zero_copy=router_weights_zero_copy,
             )
             done = comm.record_event()
 
