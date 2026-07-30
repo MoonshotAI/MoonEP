@@ -17,6 +17,16 @@ the EP group grows.
 Reports the MoonEP communication operators used by Megatron:
   - dispatch_fwd: dispatch kernel with route-weight scatter (dedup: only
     representative ``dst >= 0`` rows are transferred).
+  - publish_meta: producer-direct-out completion with the hidden payload
+    already in final owner placement. It scatters route metadata, zero-fills
+    padding, rebuilds dedup metadata, and publishes visibility. The difference
+    from dispatch_fwd is an upper bound on removable standalone payload-path
+    cost, not an end-to-end fused-producer speedup.
+  - source_pull: runtime materialization from the one-physical-copy
+    owner-sharded source object. It includes route metadata, padding, and
+    explicit peer-VMM row loads. Because it writes duplicate slots directly,
+    compare it with dispatch_fwd + epilogue_fwd for the same ready-to-consume
+    contiguous expert view.
   - dispatch_bwd: hidden-only dispatch kernel with the saved plan.
   - epilogue_fwd: in-place duplicate expansion on the NVL shard
     (dispatch_epilogue kernel), timed after dispatch_fwd.
@@ -167,12 +177,15 @@ def time_gpu_op(launch_fn, warmup, iters, group, cudagraph=True):
 
 def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
               num_sms=32, warmup=5, iters=20,
-              cudagraph: bool = True):
+              cudagraph: bool = True,
+              source_pull_blocks: int = 0,
+              source_pull_threads: int = 64):
     """Run one (R, S, K, E, H, Hp, bias_ratio) configuration on the given subgroup."""
     dev = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     buffer = Buffer(
         S, H, K, E, R, num_sms=num_sms, group=group,
+        enable_source_object=True,
         explicitly_destroy=True,
     )
     ctx = buffer._require_ctx()
@@ -208,6 +221,21 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
     # The plan carries the full [R, B] experts_to_copy table needed by
     # prefetch/grad_reduce.
     launch_planning(ctx, topk_flat, tpe, cu_seqlens, plan)
+    source_storage = buffer.source_storage()
+    source_storage.local_hidden.copy_(hidden)
+    source_storage.local_route_weights.copy_(weights)
+    source_view, source_cu_seqlens, source_plan = \
+        buffer.prepare_source_dispatch(
+            source_storage,
+            topk,
+            tpe,
+            inter_rank_sync=True,
+        )
+    # Use the exact plan that carries the source provenance for every
+    # following comparison. The routing inputs are identical, so it is
+    # semantically equal to the plan used by the planning timing above.
+    plan = source_plan
+    cu_seqlens = source_cu_seqlens
     dst = plan.dst
     experts_to_copy = plan.experts_to_copy
     NvS = int(ctx['NvS'])
@@ -224,6 +252,40 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
         _dispatch_fwd_call, warmup, iters, group, cudagraph=cudagraph
     )
 
+    # ---- publish_meta: prepared-object completion after a compatible
+    # producer has already written representative hidden rows into final
+    # owner placement. Reuse the payload populated above as untimed setup.
+    # This deliberately rebuilds the same fresh-plan dedup structures as
+    # dispatch_fwd, so the only omitted work is the hidden source read and
+    # representative remote stores.
+    def _publish_meta_call():
+        launch_dispatch(
+            ctx,
+            None,
+            weights,
+            plan,
+            write_payload=False,
+            build_dedup_map=True,
+        )
+
+    publish_meta_us = time_gpu_op(
+        _publish_meta_call, warmup, iters, group, cudagraph=cudagraph
+    )
+
+    def _publish_saved_meta_call():
+        launch_dispatch(
+            ctx,
+            None,
+            weights,
+            plan,
+            write_payload=False,
+            build_dedup_map=False,
+        )
+
+    publish_saved_meta_us = time_gpu_op(
+        _publish_saved_meta_call, warmup, iters, group, cudagraph=cudagraph
+    )
+
     # ---- epilogue_fwd: in-place duplicate expansion on the NVL shard
     # (load primary once, store to every duplicate slot). Timed after
     # dispatch_fwd so it reads the freshly written NVL state, matching the
@@ -235,6 +297,25 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
 
     epilogue_fwd_us = time_gpu_op(
         _epilogue_fwd_call, warmup, iters, group, cudagraph=cudagraph
+    )
+
+    # ---- source_pull: explicit owner-pull of one representative row per
+    # source-token/consumer-rank. Each loaded vector fans directly from
+    # registers through the planner-published duplicate chain; a compact
+    # range kernel initializes padding. The result is ready for the ordinary
+    # contiguous expert consumer without the dispatch dedup builder.
+    def _source_pull_call():
+        buffer.materialize_source_dispatch(
+            source_view,
+            plan,
+            with_route_weights=True,
+            zero_copy=True,
+            num_blocks=source_pull_blocks,
+            num_threads=source_pull_threads,
+        )
+
+    source_pull_us = time_gpu_op(
+        _source_pull_call, warmup, iters, group, cudagraph=cudagraph
     )
 
     # ---- dispatch_bwd: hidden-only dispatch with the saved plan.
@@ -422,6 +503,14 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
     result = {
         'planning_us': planning_us,
         'dispatch_fwd_us': dispatch_fwd_us,
+        'publish_meta_us': publish_meta_us,
+        'publish_saved_meta_us': publish_saved_meta_us,
+        'dispatch_payload_delta_us': dispatch_fwd_us - publish_meta_us,
+        'dispatch_ready_us': dispatch_fwd_us + epilogue_fwd_us,
+        'source_pull_us': source_pull_us,
+        'source_pull_delta_us': (
+            dispatch_fwd_us + epilogue_fwd_us - source_pull_us
+        ),
         'dispatch_bwd_us': dispatch_bwd_us,
         'epilogue_fwd_us': epilogue_fwd_us,
         'epilogue_bwd_us': epilogue_bwd_us,
@@ -520,8 +609,25 @@ def main():
     # profiling unusual (ep, E) combos that the default ep*14 sweep doesn't
     # produce; the planning CuTe DSL path must have a matching specialization.
     ap.add_argument("--experts", type=int, default=None)
+    ap.add_argument(
+        "--source-pull-blocks",
+        type=int,
+        default=0,
+        help=(
+            "Owner-pull materializer grid size. Zero uses the measured "
+            "49152-block cap."
+        ),
+    )
+    ap.add_argument(
+        "--source-pull-threads",
+        type=int,
+        choices=(64, 128, 256, 512),
+        default=64,
+        help="Threads per owner-pull materializer block.",
+    )
     args = ap.parse_args()
     assert args.hp % 128 == 0, f"--hp must be a multiple of 128, got {args.hp}"
+    assert args.source_pull_blocks >= 0
 
     world_rank, world_size, local_rank = setup()
 
@@ -559,7 +665,10 @@ def main():
         "ep", "H", "K", "S", "E", "Hp", "unbalance_ratio",
         "max_recv", "max_send", "load_max_mean",
         "planning_us",
-        "dispatch_fwd_us", "dispatch_bwd_us",
+        "dispatch_fwd_us", "publish_meta_us", "publish_saved_meta_us",
+        "dispatch_payload_delta_us",
+        "dispatch_ready_us", "source_pull_us", "source_pull_delta_us",
+        "dispatch_bwd_us",
         "epilogue_fwd_us", "epilogue_bwd_us",
         "combine_prologue_fwd_us", "combine_prologue_bwd_us",
         "combine_fwd_us", "combine_bwd_us",
@@ -582,9 +691,13 @@ def main():
 
     if world_rank == 0:
         header = (f"{'ep':>3} {'H':>5} {'K':>3} {'S':>5} {'E':>4} {'Hp':>5} "
-                  f"{'unb_r':>5} {'mx_rcv':>6} {'mx_snd':>6} {'mx/mean':>7} "
+                  f"{'unb_r':>5} "
+                  f"{'mx_rcv':>6} {'mx_snd':>6} {'mx/mean':>7} "
                   f"{'plan_us':>9} "
-                  f"{'d_fwd':>9} {'d_bwd':>9} "
+                  f"{'d_fwd':>9} {'pub_meta':>9} {'pub_saved':>9} "
+                  f"{'pay_delta':>9} "
+                  f"{'d_ready':>9} {'src_pull':>9} {'src_delta':>9} "
+                  f"{'d_bwd':>9} "
                   f"{'e_fwd':>9} {'e_bwd':>9} "
                   f"{'cp_fwd':>9} {'cp_bwd':>9} "
                   f"{'c_fwd':>9} {'c_bwd':>9} "
@@ -617,6 +730,8 @@ def main():
                     num_sms=args.num_sms,
                     warmup=args.warmup, iters=args.iters,
                     cudagraph=args.cudagraph,
+                    source_pull_blocks=args.source_pull_blocks,
+                    source_pull_threads=args.source_pull_threads,
                 )
             except Exception:
                 if world_rank == 0:
@@ -638,6 +753,12 @@ def main():
                         f"{res['load_max_mean']:>7.3f} "
                         f"{fmt4(res['planning_us']):>9} "
                         f"{fmt4(res['dispatch_fwd_us']):>9} "
+                        f"{fmt4(res['publish_meta_us']):>9} "
+                        f"{fmt4(res['publish_saved_meta_us']):>9} "
+                        f"{fmt4(res['dispatch_payload_delta_us']):>9} "
+                        f"{fmt4(res['dispatch_ready_us']):>9} "
+                        f"{fmt4(res['source_pull_us']):>9} "
+                        f"{fmt4(res['source_pull_delta_us']):>9} "
                         f"{fmt4(res['dispatch_bwd_us']):>9} "
                         f"{fmt4(res['epilogue_fwd_us']):>9} "
                         f"{fmt4(res['epilogue_bwd_us']):>9} "
@@ -672,6 +793,12 @@ def main():
                         f"{res['load_max_mean']:.3f}",
                         fmt4(res['planning_us']),
                         fmt4(res['dispatch_fwd_us']),
+                        fmt4(res['publish_meta_us']),
+                        fmt4(res['publish_saved_meta_us']),
+                        fmt4(res['dispatch_payload_delta_us']),
+                        fmt4(res['dispatch_ready_us']),
+                        fmt4(res['source_pull_us']),
+                        fmt4(res['source_pull_delta_us']),
                         fmt4(res['dispatch_bwd_us']),
                         fmt4(res['epilogue_fwd_us']),
                         fmt4(res['epilogue_bwd_us']),

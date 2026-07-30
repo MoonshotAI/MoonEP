@@ -79,6 +79,8 @@ buffer = Buffer(S=4096, H=7168, K=8, E=256, num_ep_ranks=8,
 
 - `num_sms=None` defaults to 32. `B` defaults to `E // num_ep_ranks`; an explicit value like `B=4` may also be passed.
 - `dispatch` / `combine` / `prefetch_weight` / `reduce_grad` all accept `async_finish=True` to run on the comm stream and return a CUDA event.
+- `prepare_dispatch` / `prepare_source_dispatch` accept the same option so
+  planning can overlap independent compute before the prepared object is used.
 
 #### dispatch fwd
 
@@ -171,6 +173,161 @@ output_sh, gathered_route_weights_sk, _ = buffer.combine(
 ```
 
 - The views alias buffer state that the next `dispatch` / `combine` overwrites — do not hold them across communication calls (autograd must not save them for backward; that case requires `zero_copy=False`).
+
+#### producer direct-out
+
+When routing is known before the dispatch payload is produced, an upstream
+producer with an explicitly compatible peer-VMM epilogue can skip the
+standalone hidden-payload dispatch. Planning first returns a prepared
+owner-sharded activation object:
+
+```python
+target, cu_seqlens, plan = buffer.prepare_dispatch(
+    topk_experts_sk,
+    tokens_per_expert,
+)
+
+# A compatible producer kernel reads target.plan.dst and writes every
+# non-negative representative destination directly into target.mapped_hidden:
+#
+# row = (dst // target.NvS) * target.NvS_padded + (dst % target.NvS)
+# producer_epilogue(..., target.mapped_hidden, target.plan.dst, ...)
+
+hidden_nvsh, route_weights_nvs, event = buffer.publish_dispatch(
+    target,
+    plan,
+    route_weights_sk=route_weights_sk,
+    zero_copy=True,
+)
+```
+
+`publish_dispatch` does not recopy hidden payloads. It scatters route metadata,
+zero-fills padded rows, builds duplicate metadata, publishes cross-rank
+visibility, and expands same-rank duplicates locally. Publication is one-shot;
+a target also expires when the same `Buffer` starts another dispatch, prepare,
+or combine operation.
+
+For a compatible direct-out producer, metadata construction can overlap the
+producer itself:
+
+```python
+prepared_publication = buffer.prepare_dispatch_publication(
+    target,
+    plan,
+    route_weights_sk=route_weights_sk,
+)
+
+# This launch runs on the caller stream while MoonEP prepares route metadata,
+# padding, and dedup structures on its communication stream.
+producer_epilogue(..., target.mapped_hidden, target.plan.dst, ...)
+
+hidden_nvsh, route_weights_nvs, done = buffer.publish_dispatch(
+    target,
+    plan,
+    async_finish=True,
+    zero_copy=True,
+    prepared_publication=prepared_publication,
+)
+```
+
+The finish phase waits for both streams, publishes the producer's remote
+writes with a post-producer visibility barrier, and then expands same-rank
+duplicates locally. The ordinary one-call `publish_dispatch` path remains the
+fallback when the framework cannot schedule this two-phase boundary.
+
+Planning can overlap independent work on the caller stream:
+
+```python
+target, cu_seqlens, plan, planning_done = buffer.prepare_dispatch(
+    topk_experts_sk,
+    tokens_per_expert,
+    async_finish=True,
+)
+independent_work()
+torch.cuda.current_stream().wait_event(planning_done)
+# target.plan.dst is now ready for the producer epilogue.
+```
+
+The target capability is `remote_final_slot_store_v1`. Generic CUDA tensor
+operations are not assumed safe for peer VMM access; the producer must be a
+kernel explicitly validated for this mapping and destination contract. Call
+ordinary `dispatch` when that capability is unavailable or when routing depends
+on the payload being produced. In a conventional MoE where the router consumes
+that same hidden tensor, this ordering constraint prevents a generic upstream
+epilogue fusion; projected/latent payloads produced after routing are the
+intended first integration case.
+
+[`bench_producer_direct_out.py`](benchmarks/bench_producer_direct_out.py)
+provides a benchmark-only CUDA Tile producer with local-output and direct-out
+epilogues. It verifies the public two-phase publication result bit-for-bit and
+measures the producer-to-ready-dispatch boundary. It is a synthetic integration
+benchmark, not a full-model latency claim, and `cuda.tile` is not imported by
+the `moonep` runtime.
+
+#### owner-sharded source view
+
+For the strongest one-physical-copy activation model, construct the Buffer with
+`enable_source_object=True`. This allocates one source `[S, H]` shard on each
+rank and maps the logical object across the EP group:
+
+```python
+source = buffer.source_storage()
+
+# The producer writes only its natural local owner placement. The router can
+# consume this ordinary local tensor before producing top-k metadata.
+producer_epilogue(..., source.local_hidden)
+topk_experts_sk, route_weights_sk, tokens_per_expert = router(
+    source.local_hidden
+)
+source.local_route_weights.copy_(route_weights_sk)
+
+source_view, cu_seqlens, plan = buffer.prepare_source_dispatch(
+    source,
+    topk_experts_sk,
+    tokens_per_expert,
+)
+
+# A compatible expert consumer reads source_view.slot_to_source,
+# source_view.slot_to_primary, and source_view.slot_to_next, then directly
+# loads representative rows from source_view.storage.mapped_hidden.
+# peer_indexed_group_gemm(source_view, cu_seqlens, ...)
+
+# Or ask the runtime to produce the ordinary contiguous expert view using
+# explicit owner-pull peer loads:
+hidden_nvsh, route_weights_nvs, _ = buffer.materialize_source_dispatch(
+    source_view,
+    plan,
+    with_route_weights=True,
+    zero_copy=True,
+)
+```
+
+Like `prepare_dispatch`, source planning accepts `async_finish=True` and
+appends a CUDA event. Wait on that event immediately before the consumer reads
+the returned source view.
+
+`prepare_source_dispatch` does not create routed hidden copies. For each valid
+local expert-layout slot, `slot_to_source` encodes its source rank and original
+token. `slot_to_primary` identifies the representative local slot for that
+source token on the consumer rank, and `slot_to_next` links its repeated final
+slots. The declared consumer capability is `peer_indexed_source_v1`.
+
+This mode is opt-in because it reserves an additional owner-sharded source
+buffer, and because the checked-in repository does not include a compatible
+peer-indexed group GEMM. Generic CUDA tensor operations must not read remote
+rows. The runtime materializer is an explicitly compatible CUDA kernel; it
+pulls hidden rows and route weights from their single physical owners, fills
+each representative hidden row once per consumer rank, fans each loaded vector
+directly from registers into same-rank top-k slots, and zeroes declared padding
+without a dispatch payload kernel, dispatch dedup builder, or local hidden-row
+reread.
+
+On four GB200s, the owner-pull materializer improved the ready-to-consume
+`H=3584, K=8, S=8192, E=896` path by 55.17% across five fresh processes.
+`H=7168, K=8` improved by 31.11% across another five fresh processes. One-run
+guards also won for `H=3584, K=16` and extreme routing skew. The path remains
+opt-in, with ordinary dispatch as the mandatory fallback for unmeasured cells
+and unsupported consumers.
 
 ```python
 # explicitly release VMM/NVLink resources held by the Buffer before destroying the process group
