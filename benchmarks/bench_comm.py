@@ -22,11 +22,11 @@ Reports the MoonEP communication operators used by Megatron:
     padding, rebuilds dedup metadata, and publishes visibility. The difference
     from dispatch_fwd is an upper bound on removable standalone payload-path
     cost, not an end-to-end fused-producer speedup.
-  - source_pull: runtime materialization from the one-physical-copy
-    owner-sharded source object. It includes route metadata, padding, and
-    explicit peer-VMM row loads. Because it writes duplicate slots directly,
-    compare it with dispatch_fwd + epilogue_fwd for the same ready-to-consume
-    contiguous expert view.
+  - source_pull (with --enable-source-object): runtime materialization from
+    the one-physical-copy owner-sharded source object. It includes route
+    metadata, padding, and explicit peer-VMM row loads. Because it writes
+    duplicate slots directly, compare it with dispatch_fwd + epilogue_fwd for
+    the same ready-to-consume contiguous expert view.
   - dispatch_bwd: hidden-only dispatch kernel with the saved plan.
   - epilogue_fwd: in-place duplicate expansion on the NVL shard
     (dispatch_epilogue kernel), timed after dispatch_fwd.
@@ -99,11 +99,13 @@ from moonep.planning import allocate_planning_outputs, launch_planning
 from moonep.prefetch import launch_prefetch
 
 
-def fmt4(x: float) -> str:
+def fmt4(x: float | None) -> str:
     """Format float to exactly 4 significant digits, keeping trailing zeros.
 
     Examples: 181.0 -> '181.0', 1486.65 -> '1487', 856.71 -> '856.7', 0.5 -> '0.5000'.
     """
+    if x is None:
+        return "-"
     if x == 0:
         return "0.000"
     d = math.floor(math.log10(abs(x))) + 1  # digits before the decimal point
@@ -178,6 +180,7 @@ def time_gpu_op(launch_fn, warmup, iters, group, cudagraph=True):
 def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
               num_sms=32, warmup=5, iters=20,
               cudagraph: bool = True,
+              enable_source_object: bool = False,
               source_pull_blocks: int = 0,
               source_pull_threads: int = 64):
     """Run one (R, S, K, E, H, Hp, bias_ratio) configuration on the given subgroup."""
@@ -185,7 +188,7 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
 
     buffer = Buffer(
         S, H, K, E, R, num_sms=num_sms, group=group,
-        enable_source_object=True,
+        enable_source_object=enable_source_object,
         explicitly_destroy=True,
     )
     ctx = buffer._require_ctx()
@@ -221,21 +224,24 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
     # The plan carries the full [R, B] experts_to_copy table needed by
     # prefetch/grad_reduce.
     launch_planning(ctx, topk_flat, tpe, cu_seqlens, plan)
-    source_storage = buffer.source_storage()
-    source_storage.local_hidden.copy_(hidden)
-    source_storage.local_route_weights.copy_(weights)
-    source_view, source_cu_seqlens, source_plan = \
-        buffer.prepare_source_dispatch(
-            source_storage,
-            topk,
-            tpe,
-            inter_rank_sync=True,
+    source_view = None
+    if enable_source_object:
+        source_storage = buffer.source_storage()
+        source_storage.local_hidden.copy_(hidden)
+        source_storage.local_route_weights.copy_(weights)
+        source_view, source_cu_seqlens, source_plan = (
+            buffer.prepare_source_dispatch(
+                source_storage,
+                topk,
+                tpe,
+                inter_rank_sync=True,
+            )
         )
-    # Use the exact plan that carries the source provenance for every
-    # following comparison. The routing inputs are identical, so it is
-    # semantically equal to the plan used by the planning timing above.
-    plan = source_plan
-    cu_seqlens = source_cu_seqlens
+        # Use the exact plan that carries the source provenance for every
+        # following comparison. The routing inputs are identical, so it is
+        # semantically equal to the plan used by the planning timing above.
+        plan = source_plan
+        cu_seqlens = source_cu_seqlens
     dst = plan.dst
     experts_to_copy = plan.experts_to_copy
     NvS = int(ctx['NvS'])
@@ -304,19 +310,21 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
     # registers through the planner-published duplicate chain; a compact
     # range kernel initializes padding. The result is ready for the ordinary
     # contiguous expert consumer without the dispatch dedup builder.
-    def _source_pull_call():
-        buffer.materialize_source_dispatch(
-            source_view,
-            plan,
-            with_route_weights=True,
-            zero_copy=True,
-            num_blocks=source_pull_blocks,
-            num_threads=source_pull_threads,
-        )
+    source_pull_us = None
+    if source_view is not None:
+        def _source_pull_call():
+            buffer.materialize_source_dispatch(
+                source_view,
+                plan,
+                with_route_weights=True,
+                zero_copy=True,
+                num_blocks=source_pull_blocks,
+                num_threads=source_pull_threads,
+            )
 
-    source_pull_us = time_gpu_op(
-        _source_pull_call, warmup, iters, group, cudagraph=cudagraph
-    )
+        source_pull_us = time_gpu_op(
+            _source_pull_call, warmup, iters, group, cudagraph=cudagraph
+        )
 
     # ---- dispatch_bwd: hidden-only dispatch with the saved plan.
     grad_output = torch.randn(S, H, dtype=torch.bfloat16, device=dev)
@@ -510,6 +518,7 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
         'source_pull_us': source_pull_us,
         'source_pull_delta_us': (
             dispatch_fwd_us + epilogue_fwd_us - source_pull_us
+            if source_pull_us is not None else None
         ),
         'dispatch_bwd_us': dispatch_bwd_us,
         'epilogue_fwd_us': epilogue_fwd_us,
@@ -609,6 +618,14 @@ def main():
     # profiling unusual (ep, E) combos that the default ep*14 sweep doesn't
     # produce; the planning CuTe DSL path must have a matching specialization.
     ap.add_argument("--experts", type=int, default=None)
+    ap.add_argument(
+        "--enable-source-object",
+        action="store_true",
+        help=(
+            "Allocate and benchmark the opt-in owner-sharded source object. "
+            "The default preserves the original benchmark allocation."
+        ),
+    )
     ap.add_argument(
         "--source-pull-blocks",
         type=int,
@@ -730,6 +747,7 @@ def main():
                     num_sms=args.num_sms,
                     warmup=args.warmup, iters=args.iters,
                     cudagraph=args.cudagraph,
+                    enable_source_object=args.enable_source_object,
                     source_pull_blocks=args.source_pull_blocks,
                     source_pull_threads=args.source_pull_threads,
                 )
