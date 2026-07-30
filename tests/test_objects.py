@@ -76,6 +76,8 @@ def test_dispatch_target_state_checks_survive_python_optimization() -> None:
     ctx = {
         "hidden_buf": mapped_hidden,
         "hidden_buf_local": local_hidden,
+        "E": 2,
+        "B": 1,
     }
 
     target = replace(target, buffer_token=id(buffer))
@@ -89,3 +91,28 @@ def test_dispatch_target_state_checks_survive_python_optimization() -> None:
     buffer._published_dispatch_generation = 1
     with pytest.raises(RuntimeError, match="already been published"):
         buffer._validate_dispatch_target(ctx, target, plan)
+
+
+def test_dispatch_target_rejects_mutated_plan_layout() -> None:
+    plan = make_plan()
+    mapped_hidden = torch.empty((8, 8), dtype=torch.bfloat16)
+    target = MoonEPDispatchTarget(
+        mapped_hidden=mapped_hidden,
+        local_hidden=mapped_hidden[:4],
+        plan=plan,
+        generation=1,
+        buffer_token=1,
+        R=2,
+        S=2,
+        H=8,
+        K=1,
+        NvS=4,
+        NvS_padded=4,
+    )
+    object.__setattr__(
+        plan,
+        "zero_fill_ranges",
+        torch.zeros((2, 2), dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="plan.zero_fill_ranges"):
+        target.validate_layout()

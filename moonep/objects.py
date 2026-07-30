@@ -30,7 +30,49 @@ def _validate_tensor(
     return tensor
 
 
-@dataclass(frozen=True)
+def _validate_plan_layout(
+    plan: object,
+    *,
+    N: int,
+    R: int,
+    NvS: int,
+    K: int,
+    device: torch.device,
+) -> MoonEPCommPlan:
+    if not isinstance(plan, MoonEPCommPlan):
+        raise TypeError("plan must be a MoonEPCommPlan")
+    for name, expected in (("N", N), ("R", R), ("NvS", NvS), ("K", K)):
+        actual = int(getattr(plan, name))
+        if actual != expected:
+            raise ValueError(
+                f"plan.{name} must be {expected}, got {actual}"
+            )
+    E = int(plan.E)
+    B = int(plan.B)
+    if E <= 0 or B <= 0:
+        raise ValueError(f"plan E and B must be positive, got E={E}, B={B}")
+    if E % R != 0:
+        raise ValueError(f"plan.E={E} must be divisible by R={R}")
+    for name, tensor, shape in (
+        ("plan.dst", plan.dst, (N,)),
+        ("plan.experts_to_copy", plan.experts_to_copy, (R, B)),
+        ("plan.zero_fill_ranges", plan.zero_fill_ranges, (E + B, 2)),
+        ("plan.remote_stats", plan.remote_stats, (2,)),
+        ("plan.dup_groups", plan.dup_groups, (NvS, 3)),
+        ("plan.dup_loffs", plan.dup_loffs, (NvS,)),
+        ("plan.dup_counts", plan.dup_counts, (2,)),
+    ):
+        _validate_tensor(
+            name,
+            tensor,
+            dtype=torch.int32,
+            shape=shape,
+            device=device,
+        )
+    return plan
+
+
+@dataclass(frozen=True, slots=True)
 class MoonEPSourceStorage:
     """One physical source-activation shard per rank, globally mapped.
 
@@ -87,7 +129,7 @@ class MoonEPSourceStorage:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MoonEPSourceView:
     """Planned peer-indexed view over an owner-sharded source object.
 
@@ -114,6 +156,8 @@ class MoonEPSourceView:
     value directly to every linked final slot without an intermediate local
     reread.
 
+    The plan and metadata tensors are opaque runtime state and must not be
+    modified by callers.
     """
 
     storage: MoonEPSourceStorage
@@ -154,13 +198,17 @@ class MoonEPSourceView:
             shape=(self.NvS,),
             device=device,
         )
-        if not isinstance(self.plan, MoonEPCommPlan):
-            raise TypeError("plan must be a MoonEPCommPlan")
-        if self.plan.NvS != self.NvS or self.plan.K != self.K:
-            raise ValueError("source view and plan layouts do not match")
+        _validate_plan_layout(
+            self.plan,
+            N=self.storage.S * self.K,
+            R=self.storage.R,
+            NvS=self.NvS,
+            K=self.K,
+            device=device,
+        )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MoonEPDispatchTarget:
     """Prepared owner-sharded activation object for producer direct-out.
 
@@ -178,7 +226,8 @@ class MoonEPDispatchTarget:
     The target is intentionally capability-scoped. Generic tensor consumers
     are not assumed safe on peer VMM mappings. Publication is one-shot, and
     the target expires when the same Buffer starts another dispatch, prepare,
-    or combine operation.
+    or combine operation. The plan tensors are opaque runtime state and must
+    not be modified by callers.
     """
 
     mapped_hidden: torch.Tensor
@@ -212,18 +261,17 @@ class MoonEPDispatchTarget:
             shape=(self.NvS, self.H),
             device=mapped_hidden.device,
         )
-        if not isinstance(self.plan, MoonEPCommPlan):
-            raise TypeError("plan must be a MoonEPCommPlan")
-        _validate_tensor(
-            "plan.dst",
-            self.plan.dst,
-            dtype=torch.int32,
-            shape=(self.S * self.K,),
+        _validate_plan_layout(
+            self.plan,
+            N=self.S * self.K,
+            R=self.R,
+            NvS=self.NvS,
+            K=self.K,
             device=mapped_hidden.device,
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MoonEPPreparedPublication:
     """Metadata publication scheduled ahead of producer completion.
 

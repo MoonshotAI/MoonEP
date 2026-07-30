@@ -1023,6 +1023,8 @@ class Buffer:
             )
         view.validate_layout()
         self._validate_source_storage(ctx, view.storage)
+        if int(plan.E) != int(ctx['E']) or int(plan.B) != int(ctx['B']):
+            raise ValueError("source view plan E/B do not match this Buffer")
         if view.generation != self._dispatch_generation:
             raise RuntimeError(
                 "source view is stale: this Buffer has started another "
@@ -1224,8 +1226,10 @@ class Buffer:
         if not isinstance(target, MoonEPDispatchTarget):
             raise TypeError(
                 "target must be returned by Buffer.prepare_dispatch"
-            )
+        )
         target.validate_layout()
+        if int(plan.E) != int(ctx['E']) or int(plan.B) != int(ctx['B']):
+            raise ValueError("dispatch target plan E/B do not match this Buffer")
         if target.buffer_token != id(self):
             raise ValueError(
                 "dispatch target belongs to a different MoonEP Buffer"
