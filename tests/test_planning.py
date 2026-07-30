@@ -5,12 +5,14 @@ Run with:
 """
 
 import pytest
+import torch
 from tests.kernel_test_utils import (
     DEFAULT_TOKEN_PADDING,
     KernelCase,
     assert_all_ranks,
     assert_tensor_equal_all_ranks,
     case_params,
+    gather_tensor,
     init_case,
     make_topk,
     planning_invariant_errors,
@@ -265,6 +267,9 @@ def test_planning_matches_reference_and_invariants(dist_env, case):
     skip_if_unsupported_world_size(case, R)
 
     ctx = init_case(case, R)
+    assert (ctx["source_primary_local"] is not None) == \
+        case.enable_source_object
+    assert (ctx["source_next_local"] is not None) == case.enable_source_object
     topk, tpe = make_topk(case, rank, R)
 
     plan, cu_seqlens = allocate_planning_outputs(ctx)
@@ -305,4 +310,118 @@ def test_planning_matches_reference_and_invariants(dist_env, case):
         R,
         f"{case.name} planning invariants",
         "; ".join(errors[:5]),
+    )
+
+
+def test_owner_sharded_source_view_matches_planner_provenance(dist_env):
+    """The direct-consume view keeps one source row and exposes its slot map."""
+    rank, R = dist_env
+    case = KernelCase(
+        "owner_sharded_source",
+        S=17,
+        K=3,
+        epn=8,
+        H=64,
+        num_sms=8,
+        B=2,
+        token_padding=16,
+        routing="all_remote",
+        min_R=2,
+        enable_source_object=True,
+    )
+    ctx = init_case(case, R)
+    buffer = ctx["_buffer"]
+    topk, tpe = make_topk(case, rank, R)
+
+    storage = buffer.source_storage()
+    hidden = (
+        torch.arange(case.S * case.H, device=f"cuda:{rank}")
+        .reshape(case.S, case.H)
+        .to(torch.bfloat16)
+        + rank * 1024
+    )
+    storage.local_hidden.copy_(hidden)
+    view, cu_seqlens, plan = buffer.prepare_source_dispatch(
+        storage,
+        topk,
+        tpe,
+    )
+    assert view.capability == "peer_indexed_source_v1"
+    assert view.storage is storage
+    assert view.plan is plan
+    assert view.slot_to_source.data_ptr() == ctx["source_info_local"].data_ptr()
+    assert view.slot_to_primary.data_ptr() == \
+        ctx["source_primary_local"].data_ptr()
+    assert view.slot_to_next.data_ptr() == ctx["source_next_local"].data_ptr()
+    assert torch.equal(storage.local_hidden, hidden)
+    assert tuple(cu_seqlens.shape) == (case.E(R) + int(ctx["B"]),)
+
+    all_dst = gather_tensor(plan.dst, R).cpu()
+    source_info = view.slot_to_source.cpu()
+    source_primary = view.slot_to_primary.cpu()
+    source_next = view.slot_to_next.cpu()
+    expected = torch.full_like(source_info, -1)
+    expected_primary = torch.full_like(source_primary, -1)
+    expected_next = torch.full_like(source_next, -1)
+    NvS = int(ctx["NvS"])
+    for src_rank in range(R):
+        src_dst = all_dst[src_rank].tolist()
+        for source_token in range(case.S):
+            primary_by_rank = {}
+            previous_by_rank = {}
+            for kidx in range(case.K):
+                source_topk_offset = source_token * case.K + kidx
+                encoded_dst = src_dst[source_topk_offset]
+                raw_dst = encoded_dst if encoded_dst >= 0 else -encoded_dst - 1
+                dest_rank = raw_dst // NvS
+                loff = raw_dst % NvS
+                if encoded_dst >= 0:
+                    primary_by_rank[dest_rank] = loff
+                if dest_rank == rank:
+                    expected[loff] = src_rank * NvS + source_topk_offset
+                    expected_primary[loff] = primary_by_rank[dest_rank]
+                    if dest_rank in previous_by_rank:
+                        expected_next[previous_by_rank[dest_rank]] = loff
+                    previous_by_rank[dest_rank] = loff
+
+    errors = []
+    if not torch.equal(source_info, expected):
+        mismatch = (source_info != expected).nonzero().flatten()
+        for loff in mismatch[:5].tolist():
+            errors.append(
+                f"loff={loff}: actual={int(source_info[loff])}, "
+                f"expected={int(expected[loff])}"
+            )
+    if not torch.equal(source_primary, expected_primary):
+        mismatch = (source_primary != expected_primary).nonzero().flatten()
+        for loff in mismatch[:5].tolist():
+            errors.append(
+                f"primary loff={loff}: actual={int(source_primary[loff])}, "
+                f"expected={int(expected_primary[loff])}"
+            )
+    if not torch.equal(source_next, expected_next):
+        mismatch = (source_next != expected_next).nonzero().flatten()
+        for loff in mismatch[:5].tolist():
+            errors.append(
+                f"next loff={loff}: actual={int(source_next[loff])}, "
+                f"expected={int(expected_next[loff])}"
+            )
+    valid = source_info >= 0
+    if not bool(valid.any()):
+        errors.append("source view has no valid local expert slots")
+    else:
+        encoded = source_info[valid]
+        source_ranks = encoded // NvS
+        source_tokens = (encoded % NvS) // case.K
+        if not bool(((source_ranks >= 0) & (source_ranks < R)).all()):
+            errors.append("decoded source rank is out of range")
+        if not bool(((source_tokens >= 0) & (source_tokens < case.S)).all()):
+            errors.append("decoded source token is out of range")
+
+    assert_all_ranks(
+        not errors,
+        rank,
+        R,
+        "owner-sharded source provenance",
+        "; ".join(errors),
     )

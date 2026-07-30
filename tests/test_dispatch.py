@@ -425,6 +425,308 @@ def test_dispatch_saved_plan_hidden_only_reuses_dst_and_skips_weights(dist_env):
     )
 
 
+def test_prepared_dispatch_object_publishes_external_payload(dist_env):
+    """Emulate a producer direct-out, then run MoonEP's metadata-only publish.
+
+    The first payload-only launch is a correctness oracle for the external
+    producer contract: it writes representative rows according to ``dst`` but
+    deliberately skips dedup construction and route metadata. The public
+    publish path must complete those pieces without recopying hidden payloads.
+    """
+    from moonep.dispatch import launch_dispatch
+
+    rank, R = dist_env
+    case = KernelCase(
+        "prepared_object",
+        S=17,
+        K=3,
+        epn=8,
+        H=64,
+        num_sms=8,
+        B=2,
+        token_padding=16,
+        routing="all_remote",
+        min_R=2,
+    )
+    ctx = init_case(case, R)
+    buffer = ctx["_buffer"]
+    topk, tpe = make_topk(case, rank, R)
+    hidden = _traceable_hidden(rank, case.S, case.H)
+    weights = _traceable_weights(rank, case.S, case.K)
+
+    target, cu_seqlens, plan, planning_done = buffer.prepare_dispatch(
+        topk,
+        tpe,
+        async_finish=True,
+    )
+    torch.cuda.current_stream().wait_event(planning_done)
+    assert target.capability == "remote_final_slot_store_v1"
+    assert target.mapped_hidden.data_ptr() == ctx["hidden_buf"].data_ptr()
+    assert target.local_hidden.data_ptr() == ctx["hidden_buf_local"].data_ptr()
+    assert target.plan is plan
+    assert tuple(cu_seqlens.shape) == (case.E(R) + int(ctx["B"]),)
+
+    # Emulate a compatible upstream producer. This call writes payload only;
+    # publish_dispatch below owns the fresh dedup build, route metadata,
+    # visibility publication, and local duplicate expansion.
+    launch_dispatch(
+        ctx,
+        hidden,
+        None,
+        plan,
+        write_payload=True,
+        build_dedup_map=False,
+    )
+    hidden_view, weights_view, event = buffer.publish_dispatch(
+        target,
+        plan,
+        route_weights_sk=weights,
+        zero_copy=True,
+    )
+    assert event is None
+    assert hidden_view.data_ptr() == target.local_hidden.data_ptr()
+    assert weights_view.data_ptr() == ctx["weights_buf_local"].data_ptr()
+    torch.cuda.synchronize()
+
+    scatter_errors, checked = _verify_dispatch_by_dst(
+        ctx,
+        case,
+        rank,
+        R,
+        plan.dst,
+        hidden_user=hidden_view,
+        weights_user=weights_view,
+    )
+    padding_errors, padding_rows = _zero_row_errors(
+        plan.zero_fill_ranges,
+        hidden_view,
+        weights_view,
+    )
+    errors = scatter_errors + padding_errors
+    assert_all_ranks(
+        checked > 0 and padding_rows > 0 and not errors,
+        rank,
+        R,
+        "prepared dispatch object publish",
+        "; ".join(errors[:5])
+        or f"checked={checked}, padding_rows={padding_rows}",
+    )
+
+
+def test_prepared_dispatch_object_overlaps_metadata_publication(dist_env):
+    """Two-phase publication preserves payload, weights, and padding."""
+    from moonep.dispatch import launch_dispatch
+
+    rank, R = dist_env
+    case = KernelCase(
+        "prepared_overlap",
+        S=17,
+        K=3,
+        epn=8,
+        H=64,
+        num_sms=8,
+        B=2,
+        token_padding=16,
+        routing="all_remote",
+        min_R=2,
+    )
+    ctx = init_case(case, R)
+    buffer = ctx["_buffer"]
+    topk, tpe = make_topk(case, rank, R)
+    hidden = _traceable_hidden(rank, case.S, case.H)
+    weights = _traceable_weights(rank, case.S, case.K)
+
+    target, _cu_seqlens, plan = buffer.prepare_dispatch(topk, tpe)
+    prepared = buffer.prepare_dispatch_publication(
+        target,
+        plan,
+        route_weights_sk=weights,
+    )
+    with pytest.raises(RuntimeError, match="already been prepared"):
+        buffer.prepare_dispatch_publication(
+            target,
+            plan,
+            route_weights_sk=weights,
+        )
+    with pytest.raises(RuntimeError, match="pass the returned"):
+        buffer.publish_dispatch(
+            target,
+            plan,
+            route_weights_sk=weights,
+        )
+
+    # The generic test producer shares MoonEP's barrier scratch, unlike a real
+    # direct-out epilogue, so order it after metadata here. The research CUDA
+    # Tile benchmark covers true concurrent execution.
+    prepared.metadata_done.synchronize()
+    launch_dispatch(
+        ctx,
+        hidden,
+        None,
+        plan,
+        write_payload=True,
+        build_dedup_map=False,
+    )
+    hidden_view, weights_view, done = buffer.publish_dispatch(
+        target,
+        plan,
+        async_finish=True,
+        zero_copy=True,
+        prepared_publication=prepared,
+    )
+    assert done is not None
+    done.synchronize()
+
+    scatter_errors, checked = _verify_dispatch_by_dst(
+        ctx,
+        case,
+        rank,
+        R,
+        plan.dst,
+        hidden_user=hidden_view,
+        weights_user=weights_view,
+    )
+    padding_errors, padding_rows = _zero_row_errors(
+        plan.zero_fill_ranges,
+        hidden_view,
+        weights_view,
+    )
+    errors = scatter_errors + padding_errors
+    assert_all_ranks(
+        checked > 0 and padding_rows > 0 and not errors,
+        rank,
+        R,
+        "overlapped prepared dispatch publication",
+        "; ".join(errors[:5])
+        or f"checked={checked}, padding_rows={padding_rows}",
+    )
+
+
+def test_prepared_dispatch_object_rejects_stale_generation(dist_env):
+    rank, R = dist_env
+    case = KernelCase(
+        "stale_prepared_object",
+        S=8,
+        K=2,
+        epn=4,
+        H=32,
+        num_sms=4,
+        B=1,
+        token_padding=8,
+        routing="all_remote",
+        min_R=2,
+    )
+    ctx = init_case(case, R)
+    buffer = ctx["_buffer"]
+    topk, tpe = make_topk(case, rank, R)
+
+    old_target, _old_cu, old_plan = buffer.prepare_dispatch(topk, tpe)
+    buffer.prepare_dispatch(topk, tpe)
+    with pytest.raises(RuntimeError, match="stale"):
+        buffer.publish_dispatch(old_target, old_plan)
+
+
+def test_owner_pull_materializes_source_object(dist_env):
+    """Explicit peer-VMM loads materialize the one-copy source view correctly."""
+    rank, R = dist_env
+    case = KernelCase(
+        "owner_pull_source",
+        S=31,
+        K=4,
+        epn=8,
+        H=64,
+        num_sms=8,
+        B=2,
+        token_padding=16,
+        routing="duplicate_topk",
+        min_R=2,
+        enable_source_object=True,
+    )
+    ctx = init_case(case, R)
+    buffer = ctx["_buffer"]
+    topk, tpe = make_topk(case, rank, R)
+    hidden = _traceable_hidden(rank, case.S, case.H)
+    weights = _traceable_weights(rank, case.S, case.K)
+
+    storage = buffer.source_storage()
+    storage.local_hidden.copy_(hidden)
+    storage.local_route_weights.copy_(weights)
+    view, _cu_seqlens, plan, planning_done = buffer.prepare_source_dispatch(
+        storage,
+        topk,
+        tpe,
+        async_finish=True,
+    )
+    torch.cuda.current_stream().wait_event(planning_done)
+    hidden_view, weights_view, event = buffer.materialize_source_dispatch(
+        view,
+        plan,
+        with_route_weights=True,
+        zero_copy=True,
+    )
+    assert event is None
+    assert hidden_view.data_ptr() == ctx["hidden_buf_local"].data_ptr()
+    assert weights_view.data_ptr() == ctx["weights_buf_local"].data_ptr()
+    torch.cuda.synchronize()
+
+    scatter_errors, checked = _verify_dispatch_by_dst(
+        ctx,
+        case,
+        rank,
+        R,
+        plan.dst,
+        hidden_user=hidden_view,
+        weights_user=weights_view,
+    )
+    padding_errors, padding_rows = _zero_row_errors(
+        plan.zero_fill_ranges,
+        hidden_view,
+        weights_view,
+    )
+    errors = scatter_errors + padding_errors
+    assert_all_ranks(
+        checked > 0 and padding_rows > 0 and not errors,
+        rank,
+        R,
+        "owner-pull source materialization",
+        "; ".join(errors[:5])
+        or f"checked={checked}, padding_rows={padding_rows}",
+    )
+
+    hidden_copy, weights_copy, done = buffer.materialize_source_dispatch(
+        view,
+        plan,
+        with_route_weights=True,
+        async_finish=True,
+        zero_copy=False,
+    )
+    assert done is not None
+    done.synchronize()
+    async_scatter_errors, async_checked = _verify_dispatch_by_dst(
+        ctx,
+        case,
+        rank,
+        R,
+        plan.dst,
+        hidden_user=hidden_copy,
+        weights_user=weights_copy,
+    )
+    async_padding_errors, async_padding_rows = _zero_row_errors(
+        plan.zero_fill_ranges,
+        hidden_copy,
+        weights_copy,
+    )
+    async_errors = async_scatter_errors + async_padding_errors
+    assert_all_ranks(
+        async_checked > 0 and async_padding_rows > 0 and not async_errors,
+        rank,
+        R,
+        "async owner-pull source materialization",
+        "; ".join(async_errors[:5])
+        or f"checked={async_checked}, padding_rows={async_padding_rows}",
+    )
+
+
 @pytest.mark.parametrize("case", case_params(LARGE_DISPATCH_CASES))
 def test_dispatch_large_hidden_stride_spotcheck(dist_env, case):
     rank, R = dist_env
@@ -466,6 +768,15 @@ def test_dispatch_rejects_bad_inputs(dist_env):
 
     with pytest.raises(AssertionError, match="hidden_sh"):
         launch_dispatch(ctx, hidden.float(), weights, plan, build_dedup_map=True)
+    with pytest.raises(AssertionError, match="must be None"):
+        launch_dispatch(
+            ctx,
+            hidden,
+            weights,
+            plan,
+            write_payload=False,
+            build_dedup_map=True,
+        )
     with pytest.raises(AssertionError, match="hidden_sh"):
         launch_dispatch(
             ctx,

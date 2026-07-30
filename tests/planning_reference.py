@@ -156,7 +156,7 @@ def launch_planning_torch_reference(
         ]
 
         # Pick the B remote expert segments with the most tokens for VM
-        # prefetch;
+        # prefetch.
         remote_experts.sort(key=lambda e: (alloc[e, d].item(), e), reverse=True)
         remote_stats_all[d, 0] = len(remote_experts)
         for b, e in enumerate(remote_experts[:B]):

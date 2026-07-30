@@ -54,6 +54,7 @@ import warnings
 import torch
 import torch.distributed as dist
 
+from . import _C
 from .buffer import (
     create_nvl_dist_tensor,
     create_nvl_dist_multicast_tensor,
@@ -70,8 +71,21 @@ from .combine import launch_combine
 from .combine_prologue import launch_combine_prologue
 from .prefetch import launch_prefetch
 from .grad_reduce import launch_grad_reduce
+from .objects import (
+    MoonEPDispatchTarget,
+    MoonEPPreparedPublication,
+    MoonEPSourceStorage,
+    MoonEPSourceView,
+    _validate_tensor,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be bool, got {type(value).__name__}")
+    return value
 
 
 def _align_up(x: int, alignment: int) -> int:
@@ -123,6 +137,14 @@ def _log_context_buffer_size(ctx: dict) -> None:
     meta_mapped_bytes = tensor_nbytes(ctx['meta_buf'])
     hidden_chunk_bytes = hidden_mapped_bytes // R
     meta_chunk_bytes = meta_mapped_bytes // R
+    source_chunk_bytes = (
+        tensor_nbytes(ctx['source_buf']) // R
+        if ctx.get('source_buf') is not None else 0
+    )
+    source_weights_chunk_bytes = (
+        tensor_nbytes(ctx['source_weights_buf']) // R
+        if ctx.get('source_weights_buf') is not None else 0
+    )
     local_temp_bytes = sum(
         tensor_nbytes(ctx[name])
         for name in (
@@ -138,7 +160,13 @@ def _log_context_buffer_size(ctx: dict) -> None:
         )
     )
 
-    total_buffer_bytes = hidden_chunk_bytes + meta_chunk_bytes + local_temp_bytes
+    total_buffer_bytes = (
+        hidden_chunk_bytes
+        + source_chunk_bytes
+        + source_weights_chunk_bytes
+        + meta_chunk_bytes
+        + local_temp_bytes
+    )
 
     log_lines = [
         "MoonEP comm buffer sizes:",
@@ -152,6 +180,12 @@ def _log_context_buffer_size(ctx: dict) -> None:
         f"  local_temp_buffer_size : {format_nbytes(local_temp_bytes)}",
         f"  total_size             : {format_nbytes(total_buffer_bytes)}",
     ]
+    if source_chunk_bytes:
+        log_lines[4:4] = [
+            f"  source_object_size     : {format_nbytes(source_chunk_bytes)}",
+            "  source_weights_size    : "
+            f"{format_nbytes(source_weights_chunk_bytes)}",
+        ]
     logger.info("\n".join(log_lines))
 
 
@@ -219,6 +253,7 @@ def _create_context(
     num_sms: int | None = None,
     token_padding: int = 128,
     B: int | None = None,
+    enable_source_object: bool = False,
     group: "dist.ProcessGroup | None" = None,
 ) -> dict:
     """Pre-allocate all NVLink shared buffers and local temp buffers.
@@ -228,6 +263,10 @@ def _create_context(
     still aligned to VMM granularity.
     NVLink shared buffer layout:
       - hidden_buf: [NvS_padded, H] bf16 — separate allocation, padded for VMM alignment
+      - source_buf: optional [source_rows_padded, H] bf16 owner shard,
+                    globally mapped when enable_source_object=True
+      - source_weights_buf: optional [source_topk_padded] fp32 route-weight
+                            owner shard, globally mapped with source_buf
       - meta_buf:   [meta_chunk_padded] int32 — merged allocation containing:
           [0, NvS):                weights (fp32, alias as int32)
           [NvS, NvS + R*E):       tpe gather (only rank 0 is the read/write target; symmetric reserve)
@@ -264,6 +303,7 @@ def _create_context(
     if B is None:
         B = epn
     assert isinstance(B, int) and B > 0, f"B must be a positive int, got {B}"
+    _require_bool("enable_source_object", enable_source_object)
 
     NvS_capacity = S * K
 
@@ -321,7 +361,13 @@ def _create_context(
     # counter (independent of rank count, self-resetting double buffer).
     BARRIER_SLOTS = 3
     SRC_INFO_OFF = BARRIER_OFF + BARRIER_SLOTS
-    meta_chunk_logical = SRC_INFO_OFF + NvS
+    PRIMARY_INFO_OFF = SRC_INFO_OFF + NvS
+    NEXT_INFO_OFF = PRIMARY_INFO_OFF + NvS
+    meta_chunk_logical = (
+        NEXT_INFO_OFF + NvS
+        if enable_source_object
+        else PRIMARY_INFO_OFF
+    )
 
     # Chunk size must satisfy both VMM mapping and multicast binding.
     gran = get_vmm_granularity()
@@ -350,6 +396,34 @@ def _create_context(
     # Allocate NVLink shared buffers
     # ================================================================
     hidden_buf = create_nvl_dist_tensor([NvS_padded, H], torch.bfloat16, rank, R, group=group)
+    source_rows_padded = (
+        pad_dim0_for_alignment([S, H], torch.bfloat16)
+        if enable_source_object else 0
+    )
+    source_buf = (
+        create_nvl_dist_tensor(
+            [source_rows_padded, H],
+            torch.bfloat16,
+            rank,
+            R,
+            group=group,
+        )
+        if enable_source_object else None
+    )
+    source_topk_padded = (
+        pad_dim0_for_alignment([N], torch.float32)
+        if enable_source_object else 0
+    )
+    source_weights_buf = (
+        create_nvl_dist_tensor(
+            [source_topk_padded],
+            torch.float32,
+            rank,
+            R,
+            group=group,
+        )
+        if enable_source_object else None
+    )
     meta_buf, meta_mc = create_nvl_dist_multicast_tensor(
         [meta_chunk_padded], torch.int32, rank, R, group=group,
     )
@@ -387,6 +461,7 @@ def _create_context(
         'group': group,
         'R': R, 'E': E, 'S': S, 'K': K, 'H': H,
         'B': B,
+        'enable_source_object': enable_source_object,
         'N': N, 'NvS': NvS,
         'NvS_capacity': NvS_capacity,
         'NvS_padded': NvS_padded,
@@ -397,6 +472,8 @@ def _create_context(
         'token_padding_extra': token_padding_extra,
         # NVLink shared
         'hidden_buf': hidden_buf,
+        'source_buf': source_buf,
+        'source_weights_buf': source_weights_buf,
         'meta_buf': meta_buf,
         'meta_mc': meta_mc,
         # Meta layout
@@ -409,6 +486,10 @@ def _create_context(
         'ORDER0_OFF': ORDER0_OFF,
         'BARRIER_OFF': BARRIER_OFF,
         'SRC_INFO_OFF': SRC_INFO_OFF,
+        'PRIMARY_INFO_OFF': PRIMARY_INFO_OFF,
+        'NEXT_INFO_OFF': NEXT_INFO_OFF,
+        'source_rows_padded': source_rows_padded,
+        'source_topk_padded': source_topk_padded,
         # Local temps
         'alloc': alloc, 'group_tokens': group_tokens,
         'z': z,
@@ -421,6 +502,38 @@ def _create_context(
         'num_vblocks': num_vblocks,
         # Local views
         'hidden_buf_local': hidden_buf[rank * NvS_padded: rank * NvS_padded + NvS],
+        'source_buf_local': (
+            source_buf[
+                rank * source_rows_padded:
+                rank * source_rows_padded + S
+            ]
+            if source_buf is not None else None
+        ),
+        'source_weights_buf_local': (
+            source_weights_buf[
+                rank * source_topk_padded:
+                rank * source_topk_padded + N
+            ].view(S, K)
+            if source_weights_buf is not None else None
+        ),
+        'source_info_local': meta_buf[
+            rank * meta_chunk_padded + SRC_INFO_OFF:
+            rank * meta_chunk_padded + SRC_INFO_OFF + NvS
+        ],
+        'source_primary_local': (
+            meta_buf[
+                rank * meta_chunk_padded + PRIMARY_INFO_OFF:
+                rank * meta_chunk_padded + PRIMARY_INFO_OFF + NvS
+            ]
+            if enable_source_object else None
+        ),
+        'source_next_local': (
+            meta_buf[
+                rank * meta_chunk_padded + NEXT_INFO_OFF:
+                rank * meta_chunk_padded + NEXT_INFO_OFF + NvS
+            ]
+            if enable_source_object else None
+        ),
         'weights_buf_local': meta_buf[rank * meta_chunk_padded + WEIGHTS_OFF:
                                       rank * meta_chunk_padded + WEIGHTS_OFF + NvS],
     }
@@ -450,6 +563,7 @@ class Buffer:
         comm_stream_priority: int = -1,
         enable_pdl: bool = True,
         explicitly_destroy: bool = False,
+        enable_source_object: bool = False,
     ):
         """Allocate and hold all communication buffers.
 
@@ -473,6 +587,11 @@ class Buffer:
                 False falls back to plain same-stream serial launches.
             explicitly_destroy: if True, warn (instead of auto-destroying)
                 when the Buffer is garbage-collected without ``destroy()``.
+            enable_source_object: allocate an opt-in owner-sharded source
+                activation object with one physical ``[S, H]`` shard per rank.
+                This enables ``source_storage`` / ``prepare_source_dispatch``
+                for a consumer explicitly supporting peer-indexed VMM loads.
+                The default False adds no source-object allocation.
         """
         assert isinstance(comm_stream_priority, int), (
             f"comm_stream_priority must be an int, got "
@@ -486,11 +605,15 @@ class Buffer:
         self.enable_pdl = enable_pdl
         self._comm_stream: torch.cuda.Stream | None = None
         self._destroyed = False
+        self._dispatch_generation = 0
+        self._published_dispatch_generation: int | None = None
+        self._prepared_dispatch_generation: int | None = None
         self._ctx = _create_context(
             S, H, K, E, num_ep_ranks,
             num_sms=num_sms,
             token_padding=token_padding,
             B=B,
+            enable_source_object=enable_source_object,
             group=group,
         )
         self._comm_stream = torch.cuda.Stream(
@@ -530,9 +653,16 @@ class Buffer:
         # multicast handles once the Python references disappear.
         for key in (
             'hidden_buf_local',
+            'source_buf_local',
+            'source_weights_buf_local',
+            'source_info_local',
+            'source_primary_local',
+            'source_next_local',
             'weights_buf_local',
             'meta_mc',
             'meta_buf',
+            'source_buf',
+            'source_weights_buf',
             'hidden_buf',
             'alloc',
             'group_tokens',
@@ -682,6 +812,845 @@ class Buffer:
             experts_to_copy[int(ctx['rank'])],
         )
 
+    def source_storage(self) -> MoonEPSourceStorage:
+        """Return the opt-in owner-sharded source activation object.
+
+        A producer writes its natural output to ``local_hidden``. The router
+        may consume that local view normally and writes or copies its route
+        weights to ``local_route_weights``. After routing, pass this exact
+        object to ``prepare_source_dispatch`` to obtain the peer-indexed
+        consumer view without materializing routed hidden or weight rows.
+        """
+        ctx = self._require_ctx()
+        if not bool(ctx['enable_source_object']):
+            raise RuntimeError(
+                "source_storage requires Buffer(enable_source_object=True)"
+            )
+        source_buf = ctx['source_buf']
+        source_local = ctx['source_buf_local']
+        source_weights = ctx['source_weights_buf']
+        source_weights_local = ctx['source_weights_buf_local']
+        if source_buf is None or source_local is None:
+            raise RuntimeError("source hidden storage is not initialized")
+        if source_weights is None or source_weights_local is None:
+            raise RuntimeError("source route-weight storage is not initialized")
+        storage = MoonEPSourceStorage(
+            mapped_hidden=source_buf,
+            local_hidden=source_local,
+            mapped_route_weights=source_weights,
+            local_route_weights=source_weights_local,
+            buffer_token=id(self),
+            R=int(ctx['R']),
+            S=int(ctx['S']),
+            H=int(ctx['H']),
+            K=int(ctx['K']),
+            source_rows_padded=int(ctx['source_rows_padded']),
+            source_topk_padded=int(ctx['source_topk_padded']),
+        )
+        storage.validate_layout()
+        return storage
+
+    def _validate_source_storage(
+        self,
+        ctx: dict,
+        storage: MoonEPSourceStorage,
+    ) -> None:
+        if not isinstance(storage, MoonEPSourceStorage):
+            raise TypeError("storage must be returned by Buffer.source_storage")
+        storage.validate_layout()
+        if storage.buffer_token != id(self):
+            raise ValueError(
+                "source storage belongs to a different MoonEP Buffer"
+            )
+        source_buf = ctx['source_buf']
+        source_local = ctx['source_buf_local']
+        source_weights = ctx['source_weights_buf']
+        source_weights_local = ctx['source_weights_buf_local']
+        if (
+            source_buf is None
+            or source_local is None
+            or source_weights is None
+            or source_weights_local is None
+        ):
+            raise RuntimeError("source object storage is not initialized")
+        if storage.mapped_hidden.data_ptr() != source_buf.data_ptr():
+            raise ValueError("source storage mapped-hidden view does not match")
+        if storage.local_hidden.data_ptr() != source_local.data_ptr():
+            raise ValueError("source storage local-hidden view does not match")
+        if (
+            storage.mapped_route_weights.data_ptr()
+            != source_weights.data_ptr()
+        ):
+            raise ValueError(
+                "source storage mapped route-weight view does not match"
+            )
+        if (
+            storage.local_route_weights.data_ptr()
+            != source_weights_local.data_ptr()
+        ):
+            raise ValueError(
+                "source storage local route-weight view does not match"
+            )
+
+    def prepare_source_dispatch(
+        self,
+        storage: MoonEPSourceStorage,
+        topk_experts_sk: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        async_finish: bool = False,
+        *,
+        inter_rank_sync: bool = True,
+    ):
+        """Publish a one-copy source object as a peer-indexed expert view.
+
+        The producer/router must have completed writes to
+        ``storage.local_hidden`` and ``storage.local_route_weights`` on the
+        current stream. Planning retains one physical source row per token and
+        one physical route-weight row per source rank, then publishes
+        ``slot_to_source`` provenance, ``slot_to_primary`` representative
+        reuse, and ``slot_to_next`` duplicate chains for every valid local
+        expert-layout slot. No routed hidden payload is copied or fanned out.
+
+        With ``async_finish=True``, planning runs on the communication stream
+        and a completion event is appended to the return tuple. The consumer
+        may do independent work on its current stream, then wait on that event
+        immediately before dereferencing the returned view.
+
+        The returned view requires a consumer declaring
+        ``peer_indexed_source_v1``. Ordinary MoonEP dispatch remains the
+        fallback for consumers that require contiguous materialization.
+
+        Returns ``(view, cu_seqlens, plan)``, plus a communication-stream CUDA
+        event when ``async_finish=True``.
+        """
+        ctx = self._require_ctx()
+        self._validate_source_storage(ctx, storage)
+        _require_bool("inter_rank_sync", inter_rank_sync)
+        _require_bool("async_finish", async_finish)
+        if topk_experts_sk is None or tokens_per_expert is None:
+            raise ValueError(
+                "topk_experts_sk and tokens_per_expert are required"
+            )
+        if not isinstance(topk_experts_sk, torch.Tensor):
+            raise TypeError("topk_experts_sk must be a torch.Tensor")
+        topk_flat = topk_experts_sk.reshape(-1)
+        _validate_tensor(
+            "topk_experts_sk",
+            topk_flat,
+            dtype=torch.int32,
+            shape=(int(ctx['N']),),
+            device=storage.local_hidden.device,
+        )
+        _validate_tensor(
+            "tokens_per_expert",
+            tokens_per_expert,
+            dtype=torch.int32,
+            shape=(int(ctx['E']),),
+            device=storage.local_hidden.device,
+        )
+
+        self._dispatch_generation += 1
+        self._published_dispatch_generation = None
+        self._prepared_dispatch_generation = None
+        plan, cu_seqlens = allocate_planning_outputs(ctx)
+        view = MoonEPSourceView(
+            storage=storage,
+            slot_to_source=ctx['source_info_local'],
+            slot_to_primary=ctx['source_primary_local'],
+            slot_to_next=ctx['source_next_local'],
+            plan=plan,
+            generation=self._dispatch_generation,
+            NvS=int(ctx['NvS']),
+            K=int(ctx['K']),
+        )
+        view.validate_layout()
+
+        def prepare_on_current_stream() -> None:
+            if inter_rank_sync:
+                # This barrier follows the producer on the same stream and
+                # publishes its local owner-shard writes before peer consumers.
+                launch_inter_rank_sync(ctx)
+            launch_planning(
+                ctx,
+                topk_flat,
+                tokens_per_expert,
+                cu_seqlens,
+                plan,
+            )
+
+        if not async_finish:
+            prepare_on_current_stream()
+            return view, cu_seqlens, plan
+
+        main_stream = torch.cuda.current_stream()
+        comm = self._comm_stream
+        if comm is None:
+            raise RuntimeError(
+                "MoonEP Buffer communication stream is not initialized"
+            )
+        self._record_streams(
+            (
+                storage.mapped_hidden,
+                storage.local_hidden,
+                storage.mapped_route_weights,
+                storage.local_route_weights,
+                topk_flat,
+                tokens_per_expert,
+                cu_seqlens,
+                view.slot_to_source,
+                view.slot_to_primary,
+                view.slot_to_next,
+                *self._plan_runtime_tensors(plan),
+            ),
+            comm,
+        )
+        input_ready = main_stream.record_event()
+        comm.wait_event(input_ready)
+        with torch.cuda.stream(comm):
+            prepare_on_current_stream()
+            done = comm.record_event()
+        return view, cu_seqlens, plan, done
+
+    def _validate_source_view(
+        self,
+        ctx: dict,
+        view: MoonEPSourceView,
+        plan: MoonEPCommPlan,
+    ) -> None:
+        if not isinstance(view, MoonEPSourceView):
+            raise TypeError(
+                "view must be returned by Buffer.prepare_source_dispatch"
+            )
+        view.validate_layout()
+        self._validate_source_storage(ctx, view.storage)
+        if view.generation != self._dispatch_generation:
+            raise RuntimeError(
+                "source view is stale: this Buffer has started another "
+                "dispatch, source preparation, direct-out preparation, or "
+                "combine operation"
+            )
+        if view.plan is not plan:
+            raise ValueError(
+                "plan must be the exact plan carried by the source view"
+            )
+        if (
+            view.slot_to_source.data_ptr()
+            != ctx['source_info_local'].data_ptr()
+            or view.slot_to_primary.data_ptr()
+            != ctx['source_primary_local'].data_ptr()
+            or view.slot_to_next.data_ptr()
+            != ctx['source_next_local'].data_ptr()
+        ):
+            raise ValueError("source view metadata does not match this Buffer")
+
+    def _run_source_materialize_on_current_stream(
+        self,
+        ctx: dict,
+        view: MoonEPSourceView,
+        plan: MoonEPCommPlan,
+        with_route_weights: bool,
+        hidden_nvsh: torch.Tensor,
+        route_weights_nvs: torch.Tensor | None,
+        *,
+        zero_copy: bool,
+        num_blocks: int,
+        num_threads: int,
+    ) -> None:
+        # Pull one representative hidden row per source-token/consumer-rank
+        # and fan each loaded vector directly from registers into its linked
+        # same-rank top-k slots. Route weights remain per-slot peer loads;
+        # padding uses compact planned ranges. No dispatch metadata kernel,
+        # dedup builder, cross-rank payload barrier, or local hidden reread is
+        # needed.
+        _C.materialize_source_rows(
+            view.storage.mapped_hidden,
+            view.storage.mapped_route_weights,
+            ctx['hidden_buf_local'],
+            ctx['weights_buf_local'],
+            view.slot_to_source,
+            view.slot_to_primary,
+            view.slot_to_next,
+            plan.zero_fill_ranges,
+            int(ctx['NvS']),
+            int(ctx['K']),
+            int(ctx['source_rows_padded']),
+            int(ctx['source_topk_padded']),
+            with_route_weights,
+            num_blocks,
+            num_threads,
+        )
+        if not zero_copy:
+            hidden_nvsh.copy_(ctx['hidden_buf_local'])
+            if route_weights_nvs is not None:
+                route_weights_nvs.copy_(
+                    ctx['weights_buf_local'].view(torch.float32)
+                )
+
+    def materialize_source_dispatch(
+        self,
+        view: MoonEPSourceView,
+        plan: MoonEPCommPlan,
+        with_route_weights: bool = False,
+        async_finish: bool = False,
+        *,
+        zero_copy: bool = True,
+        num_blocks: int = 0,
+        num_threads: int = 64,
+    ):
+        """Materialize a peer-indexed source view into the local expert layout.
+
+        This is the runtime fallback for a consumer that understands the
+        object contract but still benefits from a contiguous execution view.
+        Each rank explicitly pulls only its representative planned rows from
+        their physical source owners and fans each loaded vector directly into
+        repeated local destinations. It avoids rank-to-rank payload dispatch
+        and does not require generic CUDA operations to dereference peer VMM
+        rows.
+        """
+        ctx = self._require_ctx()
+        self._validate_source_view(ctx, view, plan)
+        if not isinstance(num_blocks, int) or isinstance(num_blocks, bool):
+            raise TypeError("num_blocks must be an int")
+        if num_blocks < 0:
+            raise ValueError(
+                "num_blocks must be non-negative; zero selects the default"
+            )
+        if not isinstance(num_threads, int) or isinstance(num_threads, bool):
+            raise TypeError("num_threads must be an int")
+        if num_threads not in (64, 128, 256, 512):
+            raise ValueError(
+                "num_threads must be one of 64, 128, 256, or 512"
+            )
+        _require_bool("with_route_weights", with_route_weights)
+        _require_bool("async_finish", async_finish)
+        _require_bool("zero_copy", zero_copy)
+
+        if zero_copy:
+            hidden_nvsh = ctx['hidden_buf_local']
+            route_weights_nvs = (
+                ctx['weights_buf_local'].view(torch.float32)
+                if with_route_weights else None
+            )
+        else:
+            hidden_nvsh = torch.empty_like(ctx['hidden_buf_local'])
+            route_weights_nvs = (
+                torch.empty(
+                    int(ctx['NvS']),
+                    dtype=torch.float32,
+                    device=ctx['meta_buf'].device,
+                )
+                if with_route_weights else None
+            )
+
+        if not async_finish:
+            self._run_source_materialize_on_current_stream(
+                ctx,
+                view,
+                plan,
+                with_route_weights,
+                hidden_nvsh,
+                route_weights_nvs,
+                zero_copy=zero_copy,
+                num_blocks=num_blocks,
+                num_threads=num_threads,
+            )
+            return hidden_nvsh, route_weights_nvs, None
+
+        main_stream = torch.cuda.current_stream()
+        comm = self._comm_stream
+        if comm is None:
+            raise RuntimeError(
+                "MoonEP Buffer communication stream is not initialized"
+            )
+        self._record_streams(
+            (
+                view.storage.mapped_hidden,
+                view.storage.local_hidden,
+                view.storage.mapped_route_weights,
+                view.storage.local_route_weights,
+                view.slot_to_source,
+                view.slot_to_primary,
+                view.slot_to_next,
+                hidden_nvsh,
+                route_weights_nvs,
+                *self._plan_runtime_tensors(plan),
+            ),
+            comm,
+        )
+        input_ready = main_stream.record_event()
+        comm.wait_event(input_ready)
+        with torch.cuda.stream(comm):
+            self._run_source_materialize_on_current_stream(
+                ctx,
+                view,
+                plan,
+                with_route_weights,
+                hidden_nvsh,
+                route_weights_nvs,
+                zero_copy=zero_copy,
+                num_blocks=num_blocks,
+                num_threads=num_threads,
+            )
+            done = comm.record_event()
+        return hidden_nvsh, route_weights_nvs, done
+
+    def _make_dispatch_target(
+        self,
+        ctx: dict,
+        plan: MoonEPCommPlan,
+    ) -> MoonEPDispatchTarget:
+        target = MoonEPDispatchTarget(
+            mapped_hidden=ctx['hidden_buf'],
+            local_hidden=ctx['hidden_buf_local'],
+            plan=plan,
+            generation=self._dispatch_generation,
+            buffer_token=id(self),
+            R=int(ctx['R']),
+            S=int(ctx['S']),
+            H=int(ctx['H']),
+            K=int(ctx['K']),
+            NvS=int(ctx['NvS']),
+            NvS_padded=int(ctx['NvS_padded']),
+        )
+        target.validate_layout()
+        return target
+
+    def _validate_dispatch_target(
+        self,
+        ctx: dict,
+        target: MoonEPDispatchTarget,
+        plan: MoonEPCommPlan,
+    ) -> None:
+        if not isinstance(target, MoonEPDispatchTarget):
+            raise TypeError(
+                "target must be returned by Buffer.prepare_dispatch"
+            )
+        target.validate_layout()
+        if target.buffer_token != id(self):
+            raise ValueError(
+                "dispatch target belongs to a different MoonEP Buffer"
+            )
+        if target.generation != self._dispatch_generation:
+            raise RuntimeError(
+                "dispatch target is stale: this Buffer has started another "
+                "dispatch, prepare, or combine operation"
+            )
+        if target.generation == self._published_dispatch_generation:
+            raise RuntimeError("dispatch target has already been published")
+        if target.plan is not plan:
+            raise ValueError(
+                "plan must be the exact plan carried by the dispatch target"
+            )
+        if (
+            target.mapped_hidden.data_ptr() != ctx['hidden_buf'].data_ptr()
+            or target.local_hidden.data_ptr()
+            != ctx['hidden_buf_local'].data_ptr()
+        ):
+            raise ValueError("dispatch target storage does not match this Buffer")
+
+    def prepare_dispatch(
+        self,
+        topk_experts_sk: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        async_finish: bool = False,
+        *,
+        inter_rank_sync: bool = True,
+    ):
+        """Prepare an owner-sharded activation object for producer direct-out.
+
+        This runs MoonEP planning but does not read or move hidden activations.
+        A compatible upstream producer kernel can consume ``target.plan.dst``
+        and write natural output rows directly into ``target.mapped_hidden``.
+        Only non-negative destinations are representative payload rows.
+
+        The producer must run on the same CUDA stream or explicitly wait for
+        the planning stream. After it finishes, call ``publish_dispatch`` to
+        scatter route metadata, zero padding, build duplicate metadata, publish
+        cross-rank visibility, and expand duplicates locally.
+
+        With ``async_finish=True``, planning runs on the communication stream
+        and a completion event is appended to the return tuple. The producer
+        must wait on it before using ``plan.dst``.
+
+        Returns ``(target, cu_seqlens, plan)``, plus a communication-stream
+        CUDA event when ``async_finish=True``. The target expires when another
+        dispatch, prepare, or combine operation starts on this Buffer.
+        """
+        ctx = self._require_ctx()
+        _require_bool("async_finish", async_finish)
+        _require_bool("inter_rank_sync", inter_rank_sync)
+        if topk_experts_sk is None or tokens_per_expert is None:
+            raise ValueError(
+                "topk_experts_sk and tokens_per_expert are required"
+            )
+        if not isinstance(topk_experts_sk, torch.Tensor):
+            raise TypeError("topk_experts_sk must be a torch.Tensor")
+        topk_flat = topk_experts_sk.reshape(-1)
+        device = ctx['hidden_buf'].device
+        _validate_tensor(
+            "topk_experts_sk",
+            topk_flat,
+            dtype=torch.int32,
+            shape=(int(ctx['N']),),
+            device=device,
+        )
+        _validate_tensor(
+            "tokens_per_expert",
+            tokens_per_expert,
+            dtype=torch.int32,
+            shape=(int(ctx['E']),),
+            device=device,
+        )
+
+        self._dispatch_generation += 1
+        self._published_dispatch_generation = None
+        self._prepared_dispatch_generation = None
+        plan, cu_seqlens = allocate_planning_outputs(ctx)
+        target = self._make_dispatch_target(ctx, plan)
+
+        def prepare_on_current_stream() -> None:
+            if inter_rank_sync:
+                launch_inter_rank_sync(ctx)
+            launch_planning(
+                ctx,
+                topk_flat,
+                tokens_per_expert,
+                cu_seqlens,
+                plan,
+            )
+
+        if not async_finish:
+            prepare_on_current_stream()
+            return target, cu_seqlens, plan
+
+        main_stream = torch.cuda.current_stream()
+        comm = self._comm_stream
+        if comm is None:
+            raise RuntimeError(
+                "MoonEP Buffer communication stream is not initialized"
+            )
+        self._record_streams(
+            (
+                topk_flat,
+                tokens_per_expert,
+                cu_seqlens,
+                target.mapped_hidden,
+                target.local_hidden,
+                *self._plan_runtime_tensors(plan),
+            ),
+            comm,
+        )
+        input_ready = main_stream.record_event()
+        comm.wait_event(input_ready)
+        with torch.cuda.stream(comm):
+            prepare_on_current_stream()
+            done = comm.record_event()
+        return target, cu_seqlens, plan, done
+
+    def prepare_dispatch_publication(
+        self,
+        target: MoonEPDispatchTarget,
+        plan: MoonEPCommPlan,
+        route_weights_sk: torch.Tensor | None = None,
+    ) -> MoonEPPreparedPublication:
+        """Start MoonEP metadata work before a direct-out producer finishes.
+
+        Call this after ``prepare_dispatch`` and immediately before launching
+        the compatible producer on the current stream. Metadata construction
+        runs asynchronously on MoonEP's communication stream and may overlap
+        the producer because it touches only route weights, padding rows, and
+        dedup structures. The returned object is one-shot and must be passed
+        to ``publish_dispatch(prepared_publication=...)`` after the producer
+        launch.
+
+        The metadata kernel's barrier does not publish later producer-stream
+        writes. Final publication therefore executes a second visibility
+        barrier before duplicate expansion.
+        """
+        ctx = self._require_ctx()
+        self._validate_dispatch_target(ctx, target, plan)
+        if target.generation == self._prepared_dispatch_generation:
+            raise RuntimeError(
+                "dispatch target metadata has already been prepared"
+            )
+        if route_weights_sk is not None:
+            _validate_tensor(
+                "route_weights_sk",
+                route_weights_sk,
+                dtype=torch.float32,
+                shape=(int(ctx['S']), int(ctx['K'])),
+                device=ctx['meta_buf'].device,
+            )
+
+        comm = self._comm_stream
+        if comm is None:
+            raise RuntimeError(
+                "MoonEP Buffer communication stream is not initialized"
+            )
+        self._record_streams(
+            (
+                target.mapped_hidden,
+                target.local_hidden,
+                route_weights_sk,
+                *self._plan_runtime_tensors(plan),
+            ),
+            comm,
+        )
+
+        # Mark this generation before launch so a partial launch cannot be
+        # retried against partially initialized publication metadata.
+        self._prepared_dispatch_generation = target.generation
+        input_ready = torch.cuda.current_stream().record_event()
+        comm.wait_event(input_ready)
+        with torch.cuda.stream(comm):
+            launch_dispatch(
+                ctx,
+                None,
+                route_weights_sk,
+                plan,
+                write_payload=False,
+                build_dedup_map=True,
+                pdl_trigger=self.enable_pdl,
+            )
+            metadata_done = comm.record_event()
+
+        prepared = MoonEPPreparedPublication(
+            target=target,
+            plan=plan,
+            route_weights_sk=route_weights_sk,
+            metadata_done=metadata_done,
+            generation=target.generation,
+            buffer_token=id(self),
+        )
+        prepared.validate_layout()
+        return prepared
+
+    def _validate_prepared_publication(
+        self,
+        ctx: dict,
+        prepared: MoonEPPreparedPublication,
+        target: MoonEPDispatchTarget,
+        plan: MoonEPCommPlan,
+    ) -> None:
+        if not isinstance(prepared, MoonEPPreparedPublication):
+            raise TypeError(
+                "prepared_publication must be returned by "
+                "Buffer.prepare_dispatch_publication"
+            )
+        prepared.validate_layout()
+        if prepared.buffer_token != id(self):
+            raise ValueError(
+                "prepared publication belongs to a different MoonEP Buffer"
+            )
+        if prepared.target is not target or prepared.plan is not plan:
+            raise ValueError(
+                "prepared publication must carry the exact target and plan"
+            )
+        if prepared.generation != self._dispatch_generation:
+            raise RuntimeError("prepared publication is stale")
+        if prepared.generation != self._prepared_dispatch_generation:
+            raise RuntimeError(
+                "dispatch target metadata was not prepared for this generation"
+            )
+        if prepared.metadata_done.device != ctx['meta_buf'].device:
+            raise ValueError(
+                "prepared publication event belongs to a different device"
+            )
+
+    def _run_publish_dispatch_on_current_stream(
+        self,
+        ctx: dict,
+        plan: MoonEPCommPlan,
+        route_weights_sk: torch.Tensor | None,
+        hidden_nvsh: torch.Tensor,
+        route_weights_nvs: torch.Tensor | None,
+        *,
+        zero_copy: bool,
+    ) -> None:
+        launch_dispatch(
+            ctx,
+            None,
+            route_weights_sk,
+            plan,
+            write_payload=False,
+            build_dedup_map=True,
+            pdl_trigger=self.enable_pdl,
+        )
+        launch_dispatch_epilogue(ctx, plan, pdl_launch=self.enable_pdl)
+        if not zero_copy:
+            hidden_nvsh.copy_(ctx['hidden_buf_local'])
+            if route_weights_nvs is not None:
+                route_weights_nvs.copy_(
+                    ctx['weights_buf_local'].view(torch.float32)
+                )
+
+    def _run_finish_prepared_publication_on_current_stream(
+        self,
+        ctx: dict,
+        plan: MoonEPCommPlan,
+        hidden_nvsh: torch.Tensor,
+        route_weights_nvs: torch.Tensor | None,
+        *,
+        zero_copy: bool,
+    ) -> None:
+        # The caller orders this after both the direct-out producer and the
+        # metadata stream. Publish producer remote stores, then expand local
+        # duplicates from their representative rows.
+        launch_inter_rank_sync(ctx)
+        launch_dispatch_epilogue(ctx, plan, pdl_launch=self.enable_pdl)
+        if not zero_copy:
+            hidden_nvsh.copy_(ctx['hidden_buf_local'])
+            if route_weights_nvs is not None:
+                route_weights_nvs.copy_(
+                    ctx['weights_buf_local'].view(torch.float32)
+                )
+
+    def publish_dispatch(
+        self,
+        target: MoonEPDispatchTarget,
+        plan: MoonEPCommPlan,
+        route_weights_sk: torch.Tensor | None = None,
+        async_finish: bool = False,
+        *,
+        zero_copy: bool = True,
+        prepared_publication: MoonEPPreparedPublication | None = None,
+    ):
+        """Publish an externally produced dispatch object.
+
+        The external producer must have written every representative hidden row
+        described by non-negative ``target.plan.dst`` into
+        ``target.mapped_hidden``. This method performs no hidden payload copy.
+        It completes MoonEP-owned metadata, padding, visibility, and duplicate
+        expansion work, then returns ``(hidden_nvsh, route_weights_nvs, event)``.
+
+        Pass the one-shot object from ``prepare_dispatch_publication`` to use
+        the overlapped path. In that mode route weights were already supplied
+        during preparation, so ``route_weights_sk`` must be None. Publication
+        waits for both metadata and producer completion, issues a post-producer
+        visibility barrier, then expands duplicates.
+        """
+        ctx = self._require_ctx()
+        _require_bool("async_finish", async_finish)
+        _require_bool("zero_copy", zero_copy)
+        self._validate_dispatch_target(ctx, target, plan)
+
+        if prepared_publication is not None:
+            self._validate_prepared_publication(
+                ctx,
+                prepared_publication,
+                target,
+                plan,
+            )
+            if route_weights_sk is not None:
+                raise ValueError(
+                    "route_weights_sk was already supplied to "
+                    "prepare_dispatch_publication"
+                )
+            effective_route_weights = prepared_publication.route_weights_sk
+        else:
+            if target.generation == self._prepared_dispatch_generation:
+                raise RuntimeError(
+                    "dispatch target has prepared metadata; pass the returned "
+                    "prepared_publication object"
+                )
+            effective_route_weights = route_weights_sk
+
+        if effective_route_weights is not None:
+            _validate_tensor(
+                "route_weights_sk",
+                effective_route_weights,
+                dtype=torch.float32,
+                shape=(int(ctx['S']), int(ctx['K'])),
+                device=ctx['meta_buf'].device,
+            )
+
+        if zero_copy:
+            hidden_nvsh = ctx['hidden_buf_local']
+            route_weights_nvs = (
+                ctx['weights_buf_local'].view(torch.float32)
+                if effective_route_weights is not None else None
+            )
+        else:
+            hidden_nvsh = torch.empty_like(ctx['hidden_buf_local'])
+            route_weights_nvs = (
+                torch.empty(
+                    int(ctx['NvS']),
+                    dtype=torch.float32,
+                    device=ctx['meta_buf'].device,
+                )
+                if effective_route_weights is not None else None
+            )
+
+        # Publication is one-shot. Mark it after host-side validation and
+        # allocation but before launch, so a launch failure cannot be retried
+        # against potentially partially updated metadata.
+        self._published_dispatch_generation = target.generation
+
+        if prepared_publication is not None and not async_finish:
+            torch.cuda.current_stream().wait_event(
+                prepared_publication.metadata_done
+            )
+            self._run_finish_prepared_publication_on_current_stream(
+                ctx,
+                plan,
+                hidden_nvsh,
+                route_weights_nvs,
+                zero_copy=zero_copy,
+            )
+            return hidden_nvsh, route_weights_nvs, None
+
+        if not async_finish:
+            self._run_publish_dispatch_on_current_stream(
+                ctx,
+                plan,
+                effective_route_weights,
+                hidden_nvsh,
+                route_weights_nvs,
+                zero_copy=zero_copy,
+            )
+            return hidden_nvsh, route_weights_nvs, None
+
+        main_stream = torch.cuda.current_stream()
+        comm = self._comm_stream
+        if comm is None:
+            raise RuntimeError(
+                "MoonEP Buffer communication stream is not initialized"
+            )
+        self._record_streams(
+            (
+                target.mapped_hidden,
+                target.local_hidden,
+                effective_route_weights,
+                hidden_nvsh,
+                route_weights_nvs,
+                *self._plan_runtime_tensors(plan),
+            ),
+            comm,
+        )
+        producer_done = main_stream.record_event()
+        comm.wait_event(producer_done)
+        with torch.cuda.stream(comm):
+            if prepared_publication is not None:
+                # Metadata is already ordered before this point on comm.
+                self._run_finish_prepared_publication_on_current_stream(
+                    ctx,
+                    plan,
+                    hidden_nvsh,
+                    route_weights_nvs,
+                    zero_copy=zero_copy,
+                )
+            else:
+                self._run_publish_dispatch_on_current_stream(
+                    ctx,
+                    plan,
+                    effective_route_weights,
+                    hidden_nvsh,
+                    route_weights_nvs,
+                    zero_copy=zero_copy,
+                )
+            done = comm.record_event()
+        return hidden_nvsh, route_weights_nvs, done
+
     def dispatch(
         self,
         hidden_sh: torch.Tensor,
@@ -738,6 +1707,9 @@ class Buffer:
               backward passes.
         """
         ctx = self._require_ctx()
+        self._dispatch_generation += 1
+        self._published_dispatch_generation = None
+        self._prepared_dispatch_generation = None
 
         if plan is None:
             assert topk_experts_sk is not None and tokens_per_expert is not None
@@ -922,6 +1894,9 @@ class Buffer:
               None.
         """
         ctx = self._require_ctx()
+        self._dispatch_generation += 1
+        self._published_dispatch_generation = None
+        self._prepared_dispatch_generation = None
 
         assert isinstance(plan, MoonEPCommPlan), "Buffer.combine: plan is required"
 

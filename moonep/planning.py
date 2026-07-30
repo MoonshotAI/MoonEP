@@ -353,14 +353,16 @@ def _pd_issue_g2s(meta, smem_stage, src_begin, logical_count, mbar):
 class PlanningKernel:
     def __init__(self, R, E, B, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                  TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
-                 token_padding, num_sms):
+                 token_padding, enable_source_object, num_sms):
         self.R, self.E, self.B, self.S, self.K = R, E, B, S, K
         self.N = self.S * self.K
         self.NvS_capacity, self.NvS, self.num_vblocks = NvS_capacity, NvS, num_vblocks
         self.meta_stride = meta_stride
         self.TPE_OFF, self.PLAN_OFF, self.BARRIER_OFF = TPE_OFF, PLAN_OFF, BARRIER_OFF
         self.TOPK0_OFF, self.ORDER_OFF, self.ORDER0_OFF = TOPK0_OFF, ORDER_OFF, ORDER0_OFF
-        self.token_padding, self.num_sms = token_padding, num_sms
+        self.token_padding = token_padding
+        self.enable_source_object = enable_source_object
+        self.num_sms = num_sms
 
     @cute.jit
     def __call__(self, tpe, topk, meta, mc, dst, cu_seqlens,
@@ -543,6 +545,8 @@ class PlanningKernel:
         ORDER0_OFF = cutlass.const_expr(self.ORDER0_OFF)
         BARRIER_SLOTS = 3
         SRC_INFO_OFF = cutlass.const_expr(self.BARRIER_OFF + BARRIER_SLOTS)
+        PRIMARY_INFO_OFF = cutlass.const_expr(SRC_INFO_OFF + NvS)
+        NEXT_INFO_OFF = cutlass.const_expr(PRIMARY_INFO_OFF + NvS)
         ALLOC_SUB = 0
         TPE_SUB = E * R
         EOFF_SUB = 2 * E * R
@@ -970,12 +974,17 @@ class PlanningKernel:
                     copy_v4_remote(meta, ORDER_OFF, order0, N, pid, tid, num_threads, num_sms)
         else:
             self.run_c1(topk, order, tpe, lh, s_hist, s_bp, scratch, bar_p, num_sms, pid, tid)
-        # Clear this rank's src_info slice before all ranks publish fresh slot
-        # provenance into destination-rank slices below. src_info mirrors dst's
-        # rank-stride encoding: src_rank * NvS + offv; -1 is the empty-slot
-        # sentinel. offv is always in [0, N), and NvS >= N.
+        # Clear this rank's source-provenance and representative-slot slices
+        # before all ranks publish fresh values into destination-rank slices.
+        # src_info mirrors dst's rank-stride encoding:
+        # src_rank * NvS + offv; -1 is the empty-slot sentinel. primary_info
+        # is the representative local slot for the same source token on this
+        # consumer rank; it is also -1 for padding.
         for idx in cutlass.range(pid * num_threads + tid, NvS, num_sms * num_threads):
             meta[rank * ms + SRC_INFO_OFF + idx] = Int32(-1)
+            if cutlass.const_expr(self.enable_source_object):
+                meta[rank * ms + PRIMARY_INFO_OFF + idx] = Int32(-1)
+                meta[rank * ms + NEXT_INFO_OFF + idx] = Int32(-1)
         cross_rank_barrier(meta, ms, BARRIER_OFF, rank, R, bar_p, num_sms, num_threads, tid)
         s_expoff = cute.make_tensor(s_hist.iterator, cute.make_layout((E,)))
         for e in cutlass.range(tid, E, num_threads):
@@ -1078,8 +1087,11 @@ class PlanningKernel:
 
         # Canonicalize dst duplicate entries. The first top-k entry per
         # destination rank stays non-negative and copies the payload; later
-        # entries encode -raw_dst - 1 and only carry weights. Fresh dispatch
-        # materializes the dedup structures from src_info.
+        # entries encode -raw_dst - 1 and only carry weights. At the same time,
+        # publish the representative local slot for every destination slot.
+        # Owner-pull materializers can then load the source row once per
+        # consumer rank and fan loaded vectors through the linked final slots
+        # without running the dispatch dedup builder or rereading hidden rows.
         seg_dst = cute.ceil_div(S, num_sms)
         sbeg_dst = pid * seg_dst; send_dst = cutlass.min(sbeg_dst + seg_dst, S)
         for base in cutlass.range(sbeg_dst + tid, send_dst, num_threads):
@@ -1111,6 +1123,32 @@ class PlanningKernel:
                     seen_hi = seen_hi | bit
                 if dup:
                     dst_out[base_idx + k] = -(dst_vals[k]) - 1
+                if cutlass.const_expr(self.enable_source_object):
+                    primary_raw_dst = dst_vals[k]
+                    previous_raw_dst = Int32(-1)
+                    if dup:
+                        for prev_k in cutlass.range_constexpr(K):
+                            if prev_k < k:
+                                if dests[prev_k] == d:
+                                    previous_raw_dst = dst_vals[prev_k]
+                                    prior_dst = dst_out[base_idx + prev_k]
+                                    if prior_dst >= Int32(0):
+                                        primary_raw_dst = prior_dst
+                    raw_dst = dst_vals[k]
+                    loff = raw_dst % NvS
+                    primary_loff = primary_raw_dst % NvS
+                    meta[d * ms + PRIMARY_INFO_OFF + loff] = primary_loff
+                    if previous_raw_dst >= Int32(0):
+                        previous_loff = previous_raw_dst % NvS
+                        meta[
+                            d * ms + NEXT_INFO_OFF + previous_loff
+                        ] = loff
+        if cutlass.const_expr(self.enable_source_object):
+            # Planning may return independently on each rank. Publish all
+            # remote representative-slot writes before a consumer launches.
+            cross_rank_barrier(
+                meta, ms, BARRIER_OFF, rank, R, bar_p, num_sms, num_threads, tid
+            )
         cute.arch.mbarrier_wait(pd_mbar, 0)
         cu_stage_bias = _pd_stage_bias(cu_src_begin)
         zfr_stage_bias = _pd_stage_bias(zfr_src_begin)
@@ -1138,10 +1176,10 @@ class PlanningKernel:
 @functools.lru_cache(maxsize=None)
 def _get_compiled(R, E, B, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                   TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
-                  token_padding, num_sms):
+                  token_padding, enable_source_object, num_sms):
     k = PlanningKernel(R, E, B, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                        TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
-                       token_padding, num_sms)
+                       token_padding, enable_source_object, num_sms)
     i32 = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=16)
     return cute.compile(k, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32,
                         i32, i32, i32, i32, Int32(0), cuda.CUstream(0))
@@ -1167,6 +1205,7 @@ def _launch_planning_kernel(ctx, topk, tpe, dst, cu_seqlens,
         int(ctx['ORDER_OFF']),
         int(ctx['ORDER0_OFF']),
         int(ctx['token_padding']),
+        bool(ctx['enable_source_object']),
         int(ctx['num_sms']),
     )
 

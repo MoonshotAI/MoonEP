@@ -93,6 +93,7 @@ class DispatchKernel:
         meta_stride: int,
         num_sms: int,
         with_weights: bool,
+        write_payload: bool,
         build_dedup_map: bool,
         smem_budget: int,
         pdl_trigger: bool,
@@ -108,12 +109,20 @@ class DispatchKernel:
         self.SRC_INFO_OFF = SRC_INFO_OFF
         self.num_sms = num_sms
         self.with_weights = with_weights
+        self.write_payload = write_payload
         self.pdl_trigger = pdl_trigger
         self.build_dedup_map = build_dedup_map
         self.num_threads = (
             96 + 32 * DEDUP_BUILDER_WARPS if build_dedup_map else 96
         )
-        self.stages = self._pick_stages(H, smem_budget)
+        # Metadata-only publication has no G2S/S2G payload pipeline. Keep the
+        # minimum allocation accepted by the shared kernel shape instead of
+        # reserving the maximum stage depth for storage it never touches.
+        self.stages = (
+            self._pick_stages(H, smem_budget)
+            if write_payload
+            else 2
+        )
         if self.stages == 0:
             raise RuntimeError(
                 f"dispatch: H={H} too large for per-block smem budget "
@@ -358,94 +367,116 @@ class DispatchKernel:
         # Warp 0 — G2S producer
         # ============================================
         if warp_idx == self.PRODUCER_WARP:
-            load_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, stages
-            )
-            for li in cutlass.range(n_tok, unroll=1):
-                s = s_beg + li
-                load_pipe.producer_acquire(load_state)
-                # cp.async.bulk is single-thread; only lane 0 issues it.
-                if cute.arch.lane_idx() == 0:
-                    g_row_int = (
-                        gmem_src.iterator + cutlass.Int64(s) * cutlass.Int64(H)
-                    ).toint()
-                    s_row_int = (
-                        stage_smem.iterator + load_state.index * H
-                    ).toint()
-                    mbar_int = load_pipe.producer_get_barrier(load_state).toint()
-                    cp_async_bulk_g2s(
-                        s_row_int.ir_value(),
-                        g_row_int.ir_value(),
-                        Int32(H_BYTES).ir_value(),
-                        mbar_int.ir_value(),
-                    )
-                load_state.advance()
+            if cutlass.const_expr(self.write_payload):
+                load_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, stages
+                )
+                for li in cutlass.range(n_tok, unroll=1):
+                    s = s_beg + li
+                    load_pipe.producer_acquire(load_state)
+                    # cp.async.bulk is single-thread; only lane 0 issues it.
+                    if cute.arch.lane_idx() == 0:
+                        g_row_int = (
+                            gmem_src.iterator + cutlass.Int64(s) * cutlass.Int64(H)
+                        ).toint()
+                        s_row_int = (
+                            stage_smem.iterator + load_state.index * H
+                        ).toint()
+                        mbar_int = load_pipe.producer_get_barrier(load_state).toint()
+                        cp_async_bulk_g2s(
+                            s_row_int.ir_value(),
+                            g_row_int.ir_value(),
+                            Int32(H_BYTES).ir_value(),
+                            mbar_int.ir_value(),
+                        )
+                    load_state.advance()
 
         # ============================================
         # Warp 1 — S2G consumer (K stores per token + optional weight scatter)
         # ============================================
         elif warp_idx == self.CONSUMER_WARP:
-            use_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, stages
-            )
-            rel_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, stages
-            )
-            for li in cutlass.range(n_tok, unroll=1):
-                s = s_beg + li
-                sK = s * K
+            if cutlass.const_expr(self.write_payload):
+                use_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, stages
+                )
+                rel_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, stages
+                )
+                for li in cutlass.range(n_tok, unroll=1):
+                    s = s_beg + li
+                    sK = s * K
 
-                load_pipe.consumer_wait(use_state)
+                    load_pipe.consumer_wait(use_state)
 
-                # All K stores + commit + optional weight scatter run on lane 0;
-                # 32 lanes would over-decrement the bulk_group / re-scatter.
-                if cute.arch.lane_idx() == 0:
-                    s_row_int = (
-                        stage_smem.iterator + use_state.index * H
-                    ).toint()
-                    for k in cutlass.range(K, unroll=1):
-                        dst_val = dst_tensor[sK + k]
-                        # Negative dst keeps the raw destination for the
-                        # weight scatter, but marks the payload as duplicate.
-                        store_token = dst_val >= Int32(0)
-                        raw_dst = dst_val
-                        if not store_token:
-                            raw_dst = - dst_val - Int32(1)
-                        drank = raw_dst // NvS
-                        loff = raw_dst % NvS
+                    # All K stores + commit + optional weight scatter run on lane 0;
+                    # 32 lanes would over-decrement the bulk_group / re-scatter.
+                    if cute.arch.lane_idx() == 0:
+                        s_row_int = (
+                            stage_smem.iterator + use_state.index * H
+                        ).toint()
+                        for k in cutlass.range(K, unroll=1):
+                            dst_val = dst_tensor[sK + k]
+                            # Negative dst keeps the raw destination for the
+                            # weight scatter, but marks the payload as duplicate.
+                            store_token = dst_val >= Int32(0)
+                            raw_dst = dst_val
+                            if not store_token:
+                                raw_dst = - dst_val - Int32(1)
+                            drank = raw_dst // NvS
+                            loff = raw_dst % NvS
 
-                        if store_token:
-                            drow = drank * NvS_padded + loff
-                            g_row_int = (
-                                gmem_dst.iterator
-                                + cutlass.Int64(drow) * cutlass.Int64(H)
-                            ).toint()
-                            cp_async_bulk_s2g(
-                                s_row_int.ir_value(),
-                                g_row_int.ir_value(),
-                                Int32(H_BYTES).ir_value(),
-                            )
+                            if store_token:
+                                drow = drank * NvS_padded + loff
+                                g_row_int = (
+                                    gmem_dst.iterator
+                                    + cutlass.Int64(drow) * cutlass.Int64(H)
+                                ).toint()
+                                cp_async_bulk_s2g(
+                                    s_row_int.ir_value(),
+                                    g_row_int.ir_value(),
+                                    Int32(H_BYTES).ir_value(),
+                                )
 
-                        if cutlass.const_expr(self.with_weights):
-                            wb = w_tensor[sK + k]
-                            meta_tensor[
-                                drank * meta_stride + weights_off + loff
-                            ] = wb
-                    cute.arch.cp_async_bulk_commit_group()
+                            if cutlass.const_expr(self.with_weights):
+                                wb = w_tensor[sK + k]
+                                meta_tensor[
+                                    drank * meta_stride + weights_off + loff
+                                ] = wb
+                        cute.arch.cp_async_bulk_commit_group()
 
-                use_state.advance()
+                    use_state.advance()
 
-                # Throttle in-flight bulk_groups to <= STAGES-1.
-                if li >= Int32(stages - 1):
-                    cute.arch.cp_async_bulk_wait_group(stages - 1)
-                    load_pipe.consumer_release(rel_state)
-                    rel_state.advance()
+                    # Throttle in-flight bulk_groups to <= STAGES-1.
+                    if li >= Int32(stages - 1):
+                        cute.arch.cp_async_bulk_wait_group(stages - 1)
+                        load_pipe.consumer_release(rel_state)
+                        rel_state.advance()
 
-            # Drain the trailing in-flight stores. consumer_release for the
-            # last (kStages-1) stages isn't strictly needed since the kernel
-            # exits below, but we keep it symmetric so the empty mbars are
-            # in a known state if this kernel is replayed.
-            cute.arch.cp_async_bulk_wait_group(0)
+                # Drain the trailing in-flight stores. consumer_release for the
+                # last (kStages-1) stages isn't strictly needed since the kernel
+                # exits below, but we keep it symmetric so the empty mbars are
+                # in a known state if this kernel is replayed.
+                cute.arch.cp_async_bulk_wait_group(0)
+            elif cutlass.const_expr(self.with_weights):
+                # The external producer already wrote every representative
+                # payload row into gmem_dst. Use all lanes of this warp to
+                # scatter only the per-topk route metadata before publishing
+                # the object. Negative dst values still decode to their unique
+                # metadata slots.
+                lane = cute.arch.lane_idx()
+                n = S * K
+                begin = bidx * Int32(32) + lane
+                stride = Int32(self.num_sms * 32)
+                for idx in cutlass.range(begin, n, stride):
+                    dst_val = dst_tensor[idx]
+                    raw_dst = dst_val
+                    if dst_val < Int32(0):
+                        raw_dst = -dst_val - Int32(1)
+                    drank = raw_dst // NvS
+                    loff = raw_dst % NvS
+                    meta_tensor[
+                        drank * meta_stride + weights_off + loff
+                    ] = w_tensor[idx]
 
         # ============================================
         # Warp 2 — per-expert zero-fill loop (runs concurrently with
@@ -714,6 +745,7 @@ def _get_compiled(
     SRC_INFO_OFF: int,
     num_sms: int,
     with_weights: bool,
+    write_payload: bool,
     build_dedup_map: bool,
     device_index: int,
     pdl_trigger: bool,
@@ -725,6 +757,7 @@ def _get_compiled(
         SRC_INFO_OFF=SRC_INFO_OFF, meta_stride=meta_stride,
         num_sms=num_sms,
         with_weights=with_weights,
+        write_payload=write_payload,
         build_dedup_map=build_dedup_map,
         smem_budget=smem_budget,
         pdl_trigger=pdl_trigger,
@@ -842,13 +875,16 @@ def launch_dispatch(
     route_weights_sk,
     plan,
     *,
+    write_payload: bool = True,
     build_dedup_map: bool = True,
     pdl_trigger: bool = False,
 ):
     """Launch the dispatch kernel.
 
     Args:
-        hidden_sh: [S, H] bf16 source hidden states.
+        hidden_sh: [S, H] bf16 source hidden states when
+            ``write_payload=True``. Pass None when an external producer has
+            already written every representative row into ``ctx['hidden_buf']``.
         route_weights_sk: [S, K] fp32 route weights, or None to skip the
             weights scatter (placeholder tensor is passed to satisfy the
             non-null pointer constraint; the kernel ignores it when
@@ -862,6 +898,10 @@ def launch_dispatch(
             backward paths pass false so the saved dedup structures
             (``dup_groups`` / ``dup_loffs`` / ``dup_counts``) are not rebuilt
             from stale ``src_info`` scratch. The zero warp runs on both paths.
+        write_payload: copy hidden payload rows from ``hidden_sh`` when true.
+            When false, this launch only scatters route metadata, zero-fills
+            padding, builds fresh dedup metadata when requested, and publishes
+            the external producer's writes through the cross-rank barrier.
 
     The in-place duplicate expansion on the NVL shard is a separate kernel —
     call ``moonep.dispatch_epilogue.launch_dispatch_epilogue`` afterwards on the same
@@ -880,40 +920,49 @@ def launch_dispatch(
     E = int(ctx['E'])
     B = int(ctx.get('B', 0))
 
-    assert hidden_sh.dtype == torch.bfloat16 and hidden_sh.is_contiguous(), \
-        "hidden_sh must be contiguous bf16"
-    assert hidden_sh.is_cuda, "hidden_sh must be a CUDA tensor"
-    assert tuple(hidden_sh.shape) == (S, H), \
-        f"hidden_sh must be shape [S={S}, H={H}], got {tuple(hidden_sh.shape)}"
-    _check_dispatch_plan(ctx, hidden_sh, plan)
+    assert isinstance(write_payload, bool), \
+        f"write_payload must be bool, got {type(write_payload).__name__}"
+    if write_payload:
+        assert hidden_sh is not None, "hidden_sh is required when write_payload=True"
+        assert hidden_sh.dtype == torch.bfloat16 and hidden_sh.is_contiguous(), \
+            "hidden_sh must be contiguous bf16"
+        assert hidden_sh.is_cuda, "hidden_sh must be a CUDA tensor"
+        assert tuple(hidden_sh.shape) == (S, H), \
+            f"hidden_sh must be shape [S={S}, H={H}], got {tuple(hidden_sh.shape)}"
+        source_hidden = hidden_sh
+    else:
+        assert hidden_sh is None, \
+            "hidden_sh must be None when write_payload=False"
+        source_hidden = ctx['hidden_buf_local']
+    _check_dispatch_plan(ctx, source_hidden, plan)
     assert ctx['hidden_buf'].dtype == torch.bfloat16 and ctx['hidden_buf'].is_contiguous()
-    assert ctx['hidden_buf'].device == hidden_sh.device
+    assert ctx['hidden_buf'].device == source_hidden.device
     assert ctx['meta_buf'].dtype == torch.int32 and ctx['meta_buf'].is_contiguous()
-    assert ctx['meta_buf'].device == hidden_sh.device
+    assert ctx['meta_buf'].device == source_hidden.device
     assert ctx['grid_sync_bar'].dtype == torch.int32 and ctx['grid_sync_bar'].is_contiguous()
     assert ctx['grid_sync_bar'].numel() == 1
-    assert ctx['grid_sync_bar'].device == hidden_sh.device
+    assert ctx['grid_sync_bar'].device == source_hidden.device
     if with_weights:
         assert route_weights_sk.dtype == torch.float32 and route_weights_sk.is_contiguous(), \
             "route_weights_sk must be contiguous fp32"
         assert tuple(route_weights_sk.shape) == (S, K), \
             f"route_weights_sk must be shape [S={S}, K={K}], got {tuple(route_weights_sk.shape)}"
-        assert route_weights_sk.device == hidden_sh.device
+        assert route_weights_sk.device == source_hidden.device
     assert ctx['H'] % 8 == 0, "H must be multiple of 8 for 16-B bulk-copy alignment"
     if build_dedup_map:
         _check_dedup_builder_bounds(ctx)
-        _check_dedup_builder_tensors(ctx, hidden_sh.device)
+        _check_dedup_builder_tensors(ctx, source_hidden.device)
 
     NvS = int(ctx['NvS'])
     NvS_padded = int(ctx['NvS_padded'])
     meta_stride = int(ctx['meta_chunk_padded'])
     SRC_INFO_OFF = int(ctx['SRC_INFO_OFF'])
     num_sms = int(ctx['num_sms'])
-    device_index = hidden_sh.device.index
+    device_index = source_hidden.device.index
 
     dispatch_compiled = _get_compiled(
         H, R, S, K, E + B, NvS, NvS_padded, meta_stride, SRC_INFO_OFF,
-        num_sms, with_weights, build_dedup_map, device_index,
+        num_sms, with_weights, write_payload, build_dedup_map, device_index,
         bool(pdl_trigger),
     )
 
@@ -923,7 +972,7 @@ def launch_dispatch(
         route_weights_sk.view(torch.int32) if with_weights else route_weights_sk
     )
 
-    hsh_ptr = make_ptr(BFloat16, hidden_sh.data_ptr(), cute.AddressSpace.gmem,
+    hsh_ptr = make_ptr(BFloat16, source_hidden.data_ptr(), cute.AddressSpace.gmem,
                        assumed_align=16)
     hbf_ptr = make_ptr(BFloat16, ctx['hidden_buf'].data_ptr(),
                        cute.AddressSpace.gmem, assumed_align=16)

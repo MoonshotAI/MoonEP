@@ -25,6 +25,7 @@ class KernelCase:
     H: int
     num_sms: int
     B: int | None = None
+    enable_source_object: bool = False
     token_padding: int = DEFAULT_TOKEN_PADDING
     routing: str = "balanced"
     bias_ratio: float = 0.0
@@ -51,6 +52,7 @@ def init_case(case, R):
         case.E(R),
         R,
         B=case.B,
+        enable_source_object=case.enable_source_object,
         num_sms=case.num_sms,
         token_padding=case.token_padding,
     )
