@@ -264,6 +264,14 @@ measures the producer-to-ready-dispatch boundary. It is a synthetic integration
 benchmark, not a full-model latency claim, and `cuda.tile` is not imported by
 the `moonep` runtime.
 
+On four GB200s with `EP=4`, `S=8192`, and `E=896`, five fresh-process
+repetitions of every `H={3584,7168} x K={8,16} x skew={0.1,1,5}` cell saved
+86.21-274.49 us (7.93-44.25%) at that boundary when publication was overlapped.
+The non-overlapped path regressed by 37.04-42.02 us for all `H=7168, K=16`
+cells, while the overlapped path saved 86.21-109.79 us. A caller that cannot
+schedule the two-phase overlap should therefore use ordinary dispatch for
+those cells.
+
 #### owner-sharded source view
 
 For the strongest one-physical-copy activation model, construct the Buffer with
@@ -322,12 +330,13 @@ directly from registers into same-rank top-k slots, and zeroes declared padding
 without a dispatch payload kernel, dispatch dedup builder, or local hidden-row
 reread.
 
-On four GB200s, the owner-pull materializer improved the ready-to-consume
-`H=3584, K=8, S=8192, E=896` path by 55.17% across five fresh processes.
-`H=7168, K=8` improved by 31.11% across another five fresh processes. One-run
-guards also won for `H=3584, K=16` and extreme routing skew. The path remains
-opt-in, with ordinary dispatch as the mandatory fallback for unmeasured cells
-and unsupported consumers.
+On four GB200s with `EP=4`, `S=8192`, and `E=896`, five fresh-process
+repetitions of every `H={3584,7168} x K={8,16} x skew={0.1,1,5}` cell saved
+38.84-628.98 us (5.10-65.00%) over ordinary ready-view dispatch. The smallest
+margin was `H=7168, K=8, skew=5` at 38.84 us with 5.92 us candidate standard
+deviation. The path remains opt-in, with ordinary dispatch as the mandatory
+fallback outside the measured policy domain, below a deployment's safety
+margin, or for unsupported consumers.
 
 ```python
 # explicitly release VMM/NVLink resources held by the Buffer before destroying the process group

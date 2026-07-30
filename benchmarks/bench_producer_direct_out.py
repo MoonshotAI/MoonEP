@@ -8,7 +8,7 @@ dependency of ``moonep``.
 
 Example:
 
-    torchrun --nproc_per_node=4 benchmarks/bench_producer_direct_out.py \
+    torchrun --nproc_per_node=4 --module benchmarks.bench_producer_direct_out \
         --ep 4 --hidden 3584 --topk 8 --unbalance-ratio 1.0 \
         --out results/direct_out.csv
 """

@@ -920,19 +920,31 @@ def launch_dispatch(
     E = int(ctx['E'])
     B = int(ctx.get('B', 0))
 
-    assert isinstance(write_payload, bool), \
-        f"write_payload must be bool, got {type(write_payload).__name__}"
+    if not isinstance(write_payload, bool):
+        raise TypeError(
+            "write_payload must be bool, got "
+            f"{type(write_payload).__name__}"
+        )
     if write_payload:
-        assert hidden_sh is not None, "hidden_sh is required when write_payload=True"
-        assert hidden_sh.dtype == torch.bfloat16 and hidden_sh.is_contiguous(), \
-            "hidden_sh must be contiguous bf16"
-        assert hidden_sh.is_cuda, "hidden_sh must be a CUDA tensor"
-        assert tuple(hidden_sh.shape) == (S, H), \
-            f"hidden_sh must be shape [S={S}, H={H}], got {tuple(hidden_sh.shape)}"
+        if hidden_sh is None:
+            raise ValueError(
+                "hidden_sh is required when write_payload=True"
+            )
+        if hidden_sh.dtype != torch.bfloat16 or not hidden_sh.is_contiguous():
+            raise ValueError("hidden_sh must be contiguous bf16")
+        if not hidden_sh.is_cuda:
+            raise ValueError("hidden_sh must be a CUDA tensor")
+        if tuple(hidden_sh.shape) != (S, H):
+            raise ValueError(
+                f"hidden_sh must be shape [S={S}, H={H}], "
+                f"got {tuple(hidden_sh.shape)}"
+            )
         source_hidden = hidden_sh
     else:
-        assert hidden_sh is None, \
-            "hidden_sh must be None when write_payload=False"
+        if hidden_sh is not None:
+            raise ValueError(
+                "hidden_sh must be None when write_payload=False"
+            )
         source_hidden = ctx['hidden_buf_local']
     _check_dispatch_plan(ctx, source_hidden, plan)
     assert ctx['hidden_buf'].dtype == torch.bfloat16 and ctx['hidden_buf'].is_contiguous()

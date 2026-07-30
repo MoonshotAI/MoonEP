@@ -116,3 +116,37 @@ def test_dispatch_target_rejects_mutated_plan_layout() -> None:
     )
     with pytest.raises(ValueError, match="plan.zero_fill_ranges"):
         target.validate_layout()
+
+
+def test_dispatch_payload_mode_checks_survive_python_optimization() -> None:
+    from moonep.dispatch import launch_dispatch
+
+    ctx = {
+        "H": 8,
+        "R": 2,
+        "S": 2,
+        "K": 1,
+        "E": 2,
+        "B": 1,
+    }
+    plan = make_plan()
+
+    with pytest.raises(TypeError, match="write_payload must be bool"):
+        launch_dispatch(
+            ctx,
+            None,
+            None,
+            plan,
+            write_payload=1,
+        )
+    with pytest.raises(
+        ValueError,
+        match="hidden_sh is required when write_payload=True",
+    ):
+        launch_dispatch(
+            ctx,
+            None,
+            None,
+            plan,
+            write_payload=True,
+        )

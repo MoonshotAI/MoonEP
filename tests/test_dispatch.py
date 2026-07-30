@@ -766,9 +766,9 @@ def test_dispatch_rejects_bad_inputs(dist_env):
     plan, _cu = allocate_planning_outputs(ctx)
     launch_planning(ctx, topk.reshape(-1).contiguous(), tpe, _cu, plan)
 
-    with pytest.raises(AssertionError, match="hidden_sh"):
+    with pytest.raises(ValueError, match="hidden_sh"):
         launch_dispatch(ctx, hidden.float(), weights, plan, build_dedup_map=True)
-    with pytest.raises(AssertionError, match="must be None"):
+    with pytest.raises(ValueError, match="must be None"):
         launch_dispatch(
             ctx,
             hidden,
@@ -777,7 +777,7 @@ def test_dispatch_rejects_bad_inputs(dist_env):
             write_payload=False,
             build_dedup_map=True,
         )
-    with pytest.raises(AssertionError, match="hidden_sh"):
+    with pytest.raises(ValueError, match="hidden_sh"):
         launch_dispatch(
             ctx,
             hidden[: case.S // 2].contiguous(),
