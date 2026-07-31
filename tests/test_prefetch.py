@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 from moonep.buffer import create_nvl_single_owner_tensor, pad_dim0_for_alignment
 from moonep.prefetch import launch_prefetch
+from tests.kernel_test_utils import local_device_index
 
 
 def _random_experts(E, B, seed):
@@ -162,7 +163,7 @@ def dist_env():
     if owns_process_group:
         dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(local_device_index())
     R = dist.get_world_size()
     if R < 2:
         if owns_process_group:
@@ -171,7 +172,7 @@ def dist_env():
 
     yield rank, R
 
-    dist.barrier(device_ids=[rank])
+    dist.barrier(device_ids=[local_device_index()])
     if owns_process_group:
         dist.destroy_process_group()
 
@@ -189,15 +190,15 @@ def make_single_owner_experts(rank, R, E, H, Hp):
         )
         if rank == owner:
             seed = 2026 + owner + E * 13 + H * 17 + Hp * 19
-            gen = torch.Generator(device=f"cuda:{rank}").manual_seed(seed)
+            gen = torch.Generator(device="cuda").manual_seed(seed)
             mapped[:E].copy_(
                 torch.randn(E, H, Hp, dtype=torch.bfloat16,
-                            device=f"cuda:{rank}", generator=gen)
+                            device="cuda", generator=gen)
             )
             if padded_E > E:
                 mapped[E:].zero_()
         torch.cuda.synchronize()
-        dist.barrier(device_ids=[rank])
+        dist.barrier(device_ids=[local_device_index()])
         owners.append(mapped[:E])
     return owners
 
@@ -215,7 +216,7 @@ def run_case(rank, R, case):
     Hp = case["Hp"]
     B = case["B"]
     num_sms = case["num_sms"]
-    dev = f"cuda:{rank}"
+    dev = "cuda"
 
     assert H % 128 == 0 and Hp % 128 == 0, \
         f"{case['name']}: H/Hp must be multiples of 128"
@@ -268,7 +269,7 @@ def run_case(rank, R, case):
             f"H={H}, Hp={Hp}, num_sms={num_sms}"
         )
 
-    dist.barrier(device_ids=[rank])
+    dist.barrier(device_ids=[local_device_index()])
 
 
 @pytest.mark.parametrize("case", CASES, ids=[case["name"] for case in CASES])

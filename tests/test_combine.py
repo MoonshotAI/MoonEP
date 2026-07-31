@@ -83,7 +83,7 @@ LARGE_COMBINE_CASES = [
 
 
 def _random_inputs(case, rank, R, seed=0):
-    dev = f"cuda:{rank}"
+    dev = "cuda"
     gen = torch.Generator(device=dev).manual_seed(seed + rank)
     hidden = torch.randn(case.S, case.H, dtype=torch.bfloat16, device=dev, generator=gen)
     weights = torch.rand(case.S, case.K, dtype=torch.float32, device=dev, generator=gen)
@@ -180,7 +180,7 @@ def _combine_global_reference(ctx, case, rank, R, hidden, dst, cu_seqlens,
     all_cu = gather_tensor(cu_seqlens.contiguous(), R)
 
     global_buf = torch.zeros(R, NvS_padded, case.H, dtype=torch.bfloat16,
-                             device=f"cuda:{rank}")
+                             device="cuda")
     for src_r in range(R):
         for s in range(case.S):
             for k in range(case.K):
@@ -196,7 +196,7 @@ def _combine_global_reference(ctx, case, rank, R, hidden, dst, cu_seqlens,
         )
         expert_fn(global_buf[dest_r], all_cu[dest_r], expert_ids)
 
-    ref = torch.zeros(case.S, case.H, dtype=torch.float32, device=f"cuda:{rank}")
+    ref = torch.zeros(case.S, case.H, dtype=torch.float32, device="cuda")
     local_dst = all_dst[rank]
     for s in range(case.S):
         for k in range(case.K):
@@ -354,7 +354,7 @@ def test_combine_rejects_bad_inputs(dist_env):
     _hidden, _weights, dst, _cu, _expert_ids, plan, hidden_user, _weights_user = _dispatch_inputs(
         ctx, case, rank, R
     )
-    output = torch.empty(case.S, case.H, dtype=torch.bfloat16, device=f"cuda:{rank}")
+    output = torch.empty(case.S, case.H, dtype=torch.bfloat16, device="cuda")
 
     with pytest.raises(TypeError, match="hidden_sh"):
         buffer.combine(hidden_sh=output, plan=plan, hidden_nvsh=hidden_user)
@@ -367,10 +367,10 @@ def test_combine_rejects_bad_inputs(dist_env):
             plan=plan,
             hidden_nvsh=hidden_user,
             route_weights_nvs=torch.empty(
-                case.S, case.K, dtype=torch.float32, device=f"cuda:{rank}"
+                case.S, case.K, dtype=torch.float32, device="cuda"
             ),
         )
     with pytest.raises(AssertionError, match="output_sk"):
         bad_output_sk = torch.empty(case.S, case.K, dtype=torch.bfloat16,
-                                    device=f"cuda:{rank}")
+                                    device="cuda")
         launch_combine(ctx, output, dst, output_sk=bad_output_sk)

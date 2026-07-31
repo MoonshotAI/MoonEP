@@ -10,6 +10,7 @@ import torch.distributed as dist
 from moonep._C import (
     nvl_dist_alloc,
     nvl_dist_map,
+    nvl_fabric_supported,
     nvl_release_mem_handle,
     get_vmm_granularity,
     get_multicast_granularity,
@@ -25,6 +26,77 @@ _ELEM_SIZE = {
     torch.bfloat16: 2,
     torch.int32: 4,
 }
+
+# How VMM allocations are shared between the ranks of an EP group. "auto" (the
+# default) picks fabric handles when the group spans more than one node and the
+# device supports them, and POSIX fds otherwise; "fabric" / "fd" force one.
+_HANDLE_TYPE_ENV = "MOONEP_MEM_HANDLE_TYPE"
+
+
+def _use_fabric_for_group(
+    world_size: int,
+    group: dist.ProcessGroup | None,
+) -> bool:
+    mode = os.environ.get(_HANDLE_TYPE_ENV, "auto").lower()
+    assert mode in ("auto", "fabric", "fd"), (
+        f"{_HANDLE_TYPE_ENV} must be one of auto/fabric/fd, got {mode!r}"
+    )
+
+    if world_size == 1 or not dist.is_available() or not dist.is_initialized():
+        multi_node = False
+        unsupported = [] if nvl_fabric_supported() else [socket.gethostname()]
+    else:
+        probe = (socket.gethostname(), bool(nvl_fabric_supported()))
+        probes: list = [None] * world_size
+        dist.all_gather_object(probes, probe, group=group)
+        multi_node = len({host for host, _ in probes}) > 1
+        unsupported = sorted({host for host, ok in probes if not ok})
+
+    if mode == "fd":
+        # Forcing fds on a group that spans nodes would deadlock waiting on a
+        # unix socket in a tempdir the other node cannot see, so reject it here.
+        assert not multi_node, (
+            f"{_HANDLE_TYPE_ENV}=fd, but this EP group spans multiple nodes "
+            "and POSIX fds cannot be shared across them. Use auto/fabric, or "
+            "keep every EP group inside one node."
+        )
+        return False
+    if mode == "auto" and not multi_node:
+        return False  # single node: fds work and need no IMEX daemon
+
+    reason = ("this EP group spans multiple nodes" if multi_node
+              else f"{_HANDLE_TYPE_ENV}=fabric")
+    assert not unsupported, (
+        f"fabric memory handles are required ({reason}) but unsupported on: "
+        f"{unsupported}. Check that the GPUs are in one NVLink domain and "
+        "nvidia-imex is running, or keep every EP group on a single node "
+        f"({_HANDLE_TYPE_ENV}=fd)."
+    )
+    return True
+
+
+def _all_gather_shareables(
+    local_handle: bytes,
+    world_size: int,
+    group: dist.ProcessGroup | None,
+) -> list[bytes]:
+    """Gather every rank's fabric handle, indexed by group rank."""
+    handles: list = [None] * world_size
+    dist.all_gather_object(handles, local_handle, group=group)
+    return handles
+
+
+def _broadcast_shareable(
+    local_handle: bytes | None,
+    owner_rank: int,
+    group: dist.ProcessGroup | None,
+) -> bytes:
+    """Broadcast one rank's fabric handle to the whole group."""
+    obj = [local_handle]
+    src = dist.get_global_rank(group, owner_rank) if group is not None \
+        else owner_rank
+    dist.broadcast_object_list(obj, src=src, group=group)
+    return obj[0]
 
 
 def pad_to_granularity(nbytes: int) -> int:
@@ -117,27 +189,40 @@ def _exchange_ipc_fds(
 def _map_nvl_dist_tensor(
     chunk_shape: list[int],
     dtype: torch.dtype,
-    local_fd: int,
+    shareable: int | bytes,
     keepalive: torch.Tensor,
     local_rank: int,
     world_size: int,
     group: dist.ProcessGroup | None,
+    use_fabric: bool,
 ) -> torch.Tensor:
-    fds = _exchange_ipc_fds(local_fd, list(range(world_size)),
-                            local_rank, world_size, group)
-    os.close(local_fd)
-    all_fds = [fds[r] for r in range(world_size)]
-    try:
+    if use_fabric:
+        shareables = _all_gather_shareables(shareable, world_size, group)
         full_tensor = nvl_dist_map(
             chunk_shape=chunk_shape,
             dtype=dtype,
-            fds=all_fds,
+            shareables=shareables,
             local_rank=local_rank,
             world_size=world_size,
+            use_fabric=True,
         )
-    finally:
-        for fd in all_fds:
-            os.close(fd)
+    else:
+        fds = _exchange_ipc_fds(shareable, list(range(world_size)),
+                                local_rank, world_size, group)
+        os.close(shareable)
+        all_fds = [fds[r] for r in range(world_size)]
+        try:
+            full_tensor = nvl_dist_map(
+                chunk_shape=chunk_shape,
+                dtype=dtype,
+                shareables=all_fds,
+                local_rank=local_rank,
+                world_size=world_size,
+                use_fabric=False,
+            )
+        finally:
+            for fd in all_fds:
+                os.close(fd)
     full_tensor._keepalive = keepalive
     return full_tensor
 
@@ -155,13 +240,15 @@ def create_nvl_dist_tensor(
     Use pad_dim0_for_alignment() to compute the padded dim0.
 
     `local_rank` and `world_size` must match the given `group` (or the default
-    group when `group is None`). All ranks in the group exchange IPC fds.
+    group when `group is None`). All ranks in the group exchange memory handles.
     """
-    keepalive, local_fd, owned_handle = nvl_dist_alloc(shape=chunk_shape, dtype=dtype)
+    use_fabric = _use_fabric_for_group(world_size, group)
+    keepalive, shareable, owned_handle = nvl_dist_alloc(
+        shape=chunk_shape, dtype=dtype, use_fabric=use_fabric)
     try:
         return _map_nvl_dist_tensor(
-            chunk_shape, dtype, local_fd, keepalive,
-            local_rank, world_size, group,
+            chunk_shape, dtype, shareable, keepalive,
+            local_rank, world_size, group, use_fabric,
         )
     finally:
         nvl_release_mem_handle(owned_handle)
@@ -183,14 +270,17 @@ def create_nvl_dist_multicast_tensor(
     The owned allocation handle needed by `cuMulticastBindMem` stays internal to
     this helper and is released after both mappings have been created.
     """
-    keepalive, local_fd, owned_handle = nvl_dist_alloc(shape=chunk_shape, dtype=dtype)
+    use_fabric = _use_fabric_for_group(world_size, group)
+    keepalive, shareable, owned_handle = nvl_dist_alloc(
+        shape=chunk_shape, dtype=dtype, use_fabric=use_fabric)
     try:
         full_tensor = _map_nvl_dist_tensor(
-            chunk_shape, dtype, local_fd, keepalive,
-            local_rank, world_size, group,
+            chunk_shape, dtype, shareable, keepalive,
+            local_rank, world_size, group, use_fabric,
         )
         mc_view = _create_nvl_multicast_view(
             full_tensor, owned_handle, local_rank, world_size, group,
+            use_fabric,
         )
         return full_tensor, mc_view
     finally:
@@ -203,6 +293,7 @@ def _create_nvl_multicast_view(
     local_rank: int,
     world_size: int,
     group: dist.ProcessGroup | None = None,
+    use_fabric: bool = False,
 ) -> torch.Tensor:
     """Overlay a multicast (NVSwitch SHARP) mapping on an existing NVL chunk.
 
@@ -223,21 +314,27 @@ def _create_nvl_multicast_view(
     size_bytes = chunk_elems * meta_buf.element_size()
     is_root = local_rank == 0
 
-    # Root creates the multicast object and sends its IPC fd to all ranks.
+    # Root creates the multicast object and shares it with all ranks.
     if is_root:
-        mc_handle, mc_fd = nvl_multicast_create(size_bytes, world_size)
+        mc_handle, mc_shareable = nvl_multicast_create(
+            size_bytes, world_size, use_fabric=use_fabric)
     else:
-        mc_handle, mc_fd = 0, None
+        mc_handle, mc_shareable = 0, None
 
-    fds = _exchange_ipc_fds(mc_fd, [0], local_rank, world_size, group)
-    if is_root:
-        os.close(mc_fd)
-    root_fd = fds[0]
-    try:
+    if use_fabric:
+        root_handle = _broadcast_shareable(mc_shareable, 0, group)
         if not is_root:
-            mc_handle = nvl_multicast_import(root_fd)
-    finally:
-        os.close(root_fd)
+            mc_handle = nvl_multicast_import(root_handle, use_fabric=True)
+    else:
+        fds = _exchange_ipc_fds(mc_shareable, [0], local_rank, world_size, group)
+        if is_root:
+            os.close(mc_shareable)
+        root_fd = fds[0]
+        try:
+            if not is_root:
+                mc_handle = nvl_multicast_import(root_fd, use_fabric=False)
+        finally:
+            os.close(root_fd)
 
     # All ranks add their device before any bind, then barrier.
     nvl_multicast_add_device(mc_handle)
@@ -254,6 +351,7 @@ def create_nvl_single_owner_tensor(
     dtype: torch.dtype,
     owner_rank: int,
     local_rank: int,
+    group: dist.ProcessGroup | None = None,
 ) -> torch.Tensor:
     """Allocate a VMM tensor on one GPU, visible to all ranks via NVLink.
 
@@ -262,26 +360,39 @@ def create_nvl_single_owner_tensor(
     accesses go over NVLink).  shape must already be padded to VMM granularity
     (use pad_dim0_for_alignment).
     """
-    world_size = dist.get_world_size()
-    if local_rank == owner_rank:
-        keepalive, local_fd, owned_handle = nvl_dist_alloc(shape=shape, dtype=dtype)
+    world_size = dist.get_world_size(group=group)
+    use_fabric = _use_fabric_for_group(world_size, group)
+    is_owner = local_rank == owner_rank
+
+    if is_owner:
+        keepalive, shareable, owned_handle = nvl_dist_alloc(
+            shape=shape, dtype=dtype, use_fabric=use_fabric)
         nvl_release_mem_handle(owned_handle)
     else:
-        local_fd = None
+        shareable = None
 
-    fds = _exchange_ipc_fds(local_fd, [owner_rank], local_rank, world_size,
-                            group=None)
-    if local_fd is not None:
-        os.close(local_fd)
-    owner_fd = fds[owner_rank]
-    try:
+    if use_fabric:
+        owner_handle = _broadcast_shareable(shareable, owner_rank, group)
         tensor = nvl_dist_map(
             chunk_shape=shape, dtype=dtype,
-            fds=[owner_fd], local_rank=0, world_size=1,
+            shareables=[owner_handle], local_rank=0, world_size=1,
+            use_fabric=True,
         )
-    finally:
-        os.close(owner_fd)
+    else:
+        fds = _exchange_ipc_fds(shareable, [owner_rank], local_rank,
+                                world_size, group)
+        if is_owner:
+            os.close(shareable)
+        owner_fd = fds[owner_rank]
+        try:
+            tensor = nvl_dist_map(
+                chunk_shape=shape, dtype=dtype,
+                shareables=[owner_fd], local_rank=0, world_size=1,
+                use_fabric=False,
+            )
+        finally:
+            os.close(owner_fd)
 
-    if local_rank == owner_rank:
+    if is_owner:
         tensor._keepalive = keepalive
     return tensor

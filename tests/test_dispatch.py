@@ -136,18 +136,18 @@ LARGE_DISPATCH_CASES = [
 
 
 def _traceable_hidden(rank, S, H):
-    hidden = torch.zeros(S, H, dtype=torch.bfloat16, device=f"cuda:{rank}")
+    hidden = torch.zeros(S, H, dtype=torch.bfloat16, device="cuda")
     hidden_i16 = hidden.view(torch.int16)
-    s_idx = torch.arange(S, dtype=torch.int32, device=f"cuda:{rank}")
+    s_idx = torch.arange(S, dtype=torch.int32, device="cuda")
     hidden_i16[:, 0] = s_idx.to(torch.int16)
     if H > 1:
-        hidden_i16[:, 1] = torch.full((S,), rank, dtype=torch.int16, device=f"cuda:{rank}")
+        hidden_i16[:, 1] = torch.full((S,), rank, dtype=torch.int16, device="cuda")
     return hidden
 
 
 def _traceable_weights(rank, S, K):
     weights_i32 = (
-        torch.arange(S * K, dtype=torch.int32, device=f"cuda:{rank}")
+        torch.arange(S * K, dtype=torch.int32, device="cuda")
         .reshape(S, K)
         .add_(rank * S * K)
     )
@@ -315,21 +315,21 @@ def test_dispatch_scatters_hidden_and_weights_by_dst(dist_env, case):
 def test_dispatch_dedup_plan_clears_padding_with_weights(dist_env, case):
     rank, R = dist_env
     ctx = init_case(case, R)
-    hidden = torch.randn(case.S, case.H, dtype=torch.bfloat16, device=f"cuda:{rank}")
-    weights = torch.rand(case.S, case.K, dtype=torch.float32, device=f"cuda:{rank}")
+    hidden = torch.randn(case.S, case.H, dtype=torch.bfloat16, device="cuda")
+    weights = torch.rand(case.S, case.K, dtype=torch.float32, device="cuda")
 
     ctx["hidden_buf_local"].fill_(7)
     ctx["weights_buf_local"].fill_(0x55555555)
     hidden_user = torch.empty(
         (int(ctx["NvS"]), case.H),
         dtype=torch.bfloat16,
-        device=f"cuda:{rank}",
+        device="cuda",
     )
     hidden_user.fill_(7)
     weights_user = torch.empty(
         (int(ctx["NvS"]),),
         dtype=torch.float32,
-        device=f"cuda:{rank}",
+        device="cuda",
     )
     weights_user.view(torch.int32).fill_(0x55555555)
     torch.cuda.synchronize()
@@ -388,8 +388,8 @@ def test_dispatch_saved_plan_hidden_only_reuses_dst_and_skips_weights(dist_env):
     dedup_a_snapshot = clone_dedup_plan_fields(plan_a)
 
     case_b = replace(case, routing="all_local")
-    hidden_b = torch.randn(case.S, case.H, dtype=torch.bfloat16, device=f"cuda:{rank}")
-    weights_b = torch.rand(case.S, case.K, dtype=torch.float32, device=f"cuda:{rank}")
+    hidden_b = torch.randn(case.S, case.H, dtype=torch.bfloat16, device="cuda")
+    weights_b = torch.rand(case.S, case.K, dtype=torch.float32, device="cuda")
     topk_b, tpe_b = make_topk(case_b, rank, R)
     plan_b, _cu = allocate_planning_outputs(ctx)
     launch_planning(ctx, topk_b.reshape(-1).contiguous(), tpe_b, _cu, plan_b)
@@ -460,7 +460,7 @@ def test_dispatch_rejects_bad_inputs(dist_env):
     ctx = init_case(case, R)
     topk, tpe = make_topk(case, rank, R)
     hidden = _traceable_hidden(rank, case.S, case.H)
-    weights = torch.rand(case.S, case.K, dtype=torch.float32, device=f"cuda:{rank}")
+    weights = torch.rand(case.S, case.K, dtype=torch.float32, device="cuda")
     plan, _cu = allocate_planning_outputs(ctx)
     launch_planning(ctx, topk.reshape(-1).contiguous(), tpe, _cu, plan)
 

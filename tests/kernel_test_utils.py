@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 
 import pytest
@@ -10,6 +11,10 @@ from tests.generate_topk_routing import generate_topk_routing
 DEFAULT_TOKEN_PADDING = 128
 
 _ACTIVE_BUFFERS = []
+
+
+def local_device_index() -> int:
+    return int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
 
 
 def _align_up(x: int, alignment: int) -> int:
@@ -77,7 +82,7 @@ def skip_if_unsupported_world_size(case, R):
 def make_topk(case, rank, R):
     skip_if_unsupported_world_size(case, R)
 
-    dev = f"cuda:{rank}"
+    dev = "cuda"
     E = case.E(R)
     if case.K > E and case.routing in {"balanced", "biased"}:
         pytest.skip(f"case {case.name} requires K <= E, got K={case.K}, E={E}")
@@ -117,7 +122,7 @@ def gather_tensor(t, R):
 
 
 def assert_all_ranks(ok, rank, R, label, detail=""):
-    ok_tensor = torch.tensor([int(ok)], dtype=torch.int32, device=f"cuda:{rank}")
+    ok_tensor = torch.tensor([int(ok)], dtype=torch.int32, device="cuda")
     all_ok = gather_tensor(ok_tensor, R).cpu()
     if int(all_ok.sum().item()) != R:
         if not ok and detail:

@@ -15,6 +15,7 @@ from moonep.buffer import create_nvl_single_owner_tensor, pad_dim0_for_alignment
 from moonep import Buffer, MoonEPCommPlan
 from tests.kernel_test_utils import (
     clone_dedup_plan_fields,
+    local_device_index,
     dedup_plan_fields_equal,
     dedup_plan_semantic_errors,
 )
@@ -23,12 +24,12 @@ from tests.kernel_test_utils import (
 def setup():
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(local_device_index())
     return rank, dist.get_world_size()
 
 
 def make_inputs(rank, S, H, K, E, seed=0):
-    dev = f"cuda:{rank}"
+    dev = "cuda"
     g = torch.Generator(device=dev).manual_seed(seed + rank)
     hidden = torch.randn(S, H, dtype=torch.bfloat16, device=dev, generator=g)
     weights = torch.rand(S, K, dtype=torch.float32, device=dev, generator=g)
@@ -38,7 +39,7 @@ def make_inputs(rank, S, H, K, E, seed=0):
 
 
 def make_remote_expert(rank, R, E, H, Hp, owner_offset=1):
-    dev = f"cuda:{rank}"
+    dev = "cuda"
     padded_E = pad_dim0_for_alignment([E, H, Hp], torch.bfloat16)
     owners = []
     for owner in range(R):
@@ -56,7 +57,7 @@ def make_remote_expert(rank, R, E, H, Hp, owner_offset=1):
             if padded_E > E:
                 mapped[E:].zero_()
         torch.cuda.synchronize()
-        dist.barrier(device_ids=[rank])
+        dist.barrier(device_ids=[local_device_index()])
         owners.append(mapped[:E])
 
     remote_owner = (rank + owner_offset) % R
@@ -67,7 +68,7 @@ def make_remote_expert(rank, R, E, H, Hp, owner_offset=1):
 
 def make_full_weight(rank, remote_expert, B, source_offset):
     E, H, Hp = remote_expert.shape
-    dev = f"cuda:{rank}"
+    dev = "cuda"
     full_weight = torch.empty(E + B, H, Hp, dtype=torch.bfloat16, device=dev)
     full_weight[:E].copy_(remote_expert)
     if source_offset:
@@ -133,7 +134,7 @@ def reduce_base(R, B, H, Hp, offset, dev):
 
 
 def make_grad_reduce_args(rank, R, E, B, H, Hp, offsets):
-    dev = f"cuda:{rank}"
+    dev = "cuda"
     full_E = E + B
     return {
         "full_gate_grad": grad_base(full_E, H, Hp, offsets[0], dev).contiguous(),
@@ -146,7 +147,7 @@ def make_grad_reduce_args(rank, R, E, B, H, Hp, offsets):
 
 
 def expected_local_grad(rank, R, E, H, Hp, full_offset, reduce_offset, experts_to_copy):
-    dev = f"cuda:{rank}"
+    dev = "cuda"
     expected = grad_base(E, H, Hp, full_offset, dev)
     reduce_vals = reduce_base(R, experts_to_copy.shape[1], H, Hp, reduce_offset, dev)
     for src_rank in range(R):

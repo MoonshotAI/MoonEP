@@ -6,6 +6,7 @@ Run with:
 """
 
 import argparse
+import os
 import sys
 
 import torch
@@ -65,7 +66,7 @@ DEFAULT_CASES = [
 def setup():
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     return rank, dist.get_world_size()
 
 
@@ -86,7 +87,7 @@ def expert_plan(R, B, epn, counts, dev):
 
 
 def bench_case(case, args, rank, R):
-    dev = f"cuda:{rank}"
+    dev = "cuda"
     epn = int(case["epn"])
     E = R * epn
     H = int(case["H"])
@@ -117,7 +118,7 @@ def bench_case(case, args, rank, R):
     experts_to_copy = plan.flatten() if rank == 0 else \
         torch.full((R * B,), -1, dtype=torch.int32, device=dev)
     torch.cuda.synchronize()
-    dist.barrier(device_ids=[rank])
+    dist.barrier(device_ids=[torch.cuda.current_device()])
 
     def prefetch_once():
         launch_prefetch(
@@ -132,7 +133,7 @@ def bench_case(case, args, rank, R):
     for _ in range(args.warmup):
         prefetch_once()
     torch.cuda.synchronize()
-    dist.barrier(device_ids=[rank])
+    dist.barrier(device_ids=[torch.cuda.current_device()])
 
     # --no-graph keeps plain stream launches so tools like NCU can intercept
     # each kernel (graph capture/replay hides launches from kernel filters).
@@ -143,7 +144,7 @@ def bench_case(case, args, rank, R):
             for _ in range(args.iters):
                 prefetch_once()
         torch.cuda.synchronize()
-        dist.barrier(device_ids=[rank])
+        dist.barrier(device_ids=[torch.cuda.current_device()])
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -171,7 +172,7 @@ def bench_case(case, args, rank, R):
     # writes are local HBM, off the NVLink path).
     comm_gbs = slots * tile / worst_us * 1e6 / 1e9 if worst_us > 0 else 0.0
 
-    dist.barrier(device_ids=[rank])
+    dist.barrier(device_ids=[torch.cuda.current_device()])
     return worst_us, bytes_per_rank / 1e6, bw_gbs, comm_gbs, E, B, slots
 
 

@@ -28,6 +28,7 @@ import torch.distributed as dist
 from moonep import Buffer
 from moonep.buffer import create_nvl_dist_tensor, pad_dim0_for_alignment
 from moonep.grad_reduce import launch_grad_reduce
+from tests.kernel_test_utils import local_device_index
 
 
 # --------------------------------------------------------------------------
@@ -172,7 +173,7 @@ def _expected_for_rank(rank, R, E, B, plan_cpu, grads_fn, slot_fn):
 
 
 def _assert_all_ranks(ok, rank, label):
-    ok_tensor = torch.tensor([int(ok)], dtype=torch.int32, device=f"cuda:{rank}")
+    ok_tensor = torch.tensor([int(ok)], dtype=torch.int32, device="cuda")
     dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
     assert int(ok_tensor.item()) == 1, label
 
@@ -358,7 +359,7 @@ def dist_env():
     if owns_process_group:
         dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(local_device_index())
     R = dist.get_world_size()
     if R < 2:
         if owns_process_group:
@@ -367,13 +368,13 @@ def dist_env():
 
     yield rank, R
 
-    dist.barrier(device_ids=[rank])
+    dist.barrier(device_ids=[local_device_index()])
     if owns_process_group:
         dist.destroy_process_group()
 
 
 def run_case(rank, R, case):
-    dev = f"cuda:{rank}"
+    dev = "cuda"
     epn = case["epn"]
     E = R * epn
     H = case["H"]
@@ -398,7 +399,7 @@ def run_case(rank, R, case):
         remote_expert_grads = grads_fn().contiguous()
         reduce_buffers[rank].copy_(slot_fn(rank))
         torch.cuda.synchronize()
-        dist.barrier(device_ids=[rank])
+        dist.barrier(device_ids=[local_device_index()])
 
         launch_grad_reduce(
             remote_expert_grads,
@@ -412,7 +413,7 @@ def run_case(rank, R, case):
             grid_sync_bar=ctx['grid_sync_bar'],
         )
         torch.cuda.synchronize()
-        dist.barrier(device_ids=[rank])
+        dist.barrier(device_ids=[local_device_index()])
 
         _verify(rank, R, E, B, plan, grads_fn, slot_fn,
                 remote_expert_grads, reduce_buffers,
@@ -424,7 +425,7 @@ def run_case(rank, R, case):
                 f"H={H}, Hp={Hp}, num_sms={num_sms}"
             )
 
-        dist.barrier(device_ids=[rank])
+        dist.barrier(device_ids=[local_device_index()])
     finally:
         buffer.destroy()
 
@@ -444,7 +445,7 @@ def test_grad_reduce_repeated_launch(dist_env):
     an empty plan so a zero-work launch is also proven not to wedge or
     desync the barrier state for the round after it."""
     rank, R = dist_env
-    dev = f"cuda:{rank}"
+    dev = "cuda"
     epn, H, Hp, base_B, num_sms = 4, 256, 128, 5, 16
     E = R * epn
     B = pad_dim0_for_alignment([base_B, H, Hp], torch.float32)
@@ -468,7 +469,7 @@ def test_grad_reduce_repeated_launch(dist_env):
             remote_expert_grads = grads_fn()
             reduce_buffers[rank].copy_(slot_fn(rank))
             torch.cuda.synchronize()
-            dist.barrier(device_ids=[rank])
+            dist.barrier(device_ids=[local_device_index()])
 
             launch_grad_reduce(
                 remote_expert_grads,
@@ -482,7 +483,7 @@ def test_grad_reduce_repeated_launch(dist_env):
                 grid_sync_bar=ctx['grid_sync_bar'],
             )
             torch.cuda.synchronize()
-            dist.barrier(device_ids=[rank])
+            dist.barrier(device_ids=[local_device_index()])
 
             _verify(rank, R, E, B, plan, grads_fn, slot_fn,
                     remote_expert_grads, reduce_buffers,
@@ -490,7 +491,7 @@ def test_grad_reduce_repeated_launch(dist_env):
 
         if rank == 0:
             print(f"  [PASS] repeated_launch: R={R}, rounds={len(rounds)}")
-        dist.barrier(device_ids=[rank])
+        dist.barrier(device_ids=[local_device_index()])
     finally:
         buffer.destroy()
 
