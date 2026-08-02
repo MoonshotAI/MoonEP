@@ -94,6 +94,14 @@ static inline at::Tensor make_vmm_tensor(
         std::move(storage),
         c10::DispatchKeySet(c10::DispatchKey::CUDA),
         c10::scalarTypeToTypeMeta(dtype));
+    // This TensorImpl constructor is the one PyTorch uses for .data/.detach()
+    // views, so it leaves allow_tensor_metadata_change_ unset and
+    // set_sizes_contiguous() below raises on PyTorch 2.13:
+    //   "set_sizes_contiguous is not allowed on a Tensor created from .data
+    //    or .detach()".
+    // The tensor is freshly constructed here and owns its storage, so
+    // permitting the metadata change is safe.
+    impl->set_allow_tensor_metadata_change(true);
     impl->set_sizes_contiguous(shape);
     return at::Tensor(std::move(impl));
 }
@@ -236,6 +244,14 @@ inline at::Tensor nvl_dist_map(
         std::move(storage),
         c10::DispatchKeySet(c10::DispatchKey::CUDA),
         c10::scalarTypeToTypeMeta(dtype));
+    // This TensorImpl constructor is the one PyTorch uses for .data/.detach()
+    // views, so it leaves allow_tensor_metadata_change_ unset and
+    // set_sizes_contiguous() below raises on PyTorch 2.13:
+    //   "set_sizes_contiguous is not allowed on a Tensor created from .data
+    //    or .detach()".
+    // The tensor is freshly constructed here and owns its storage, so
+    // permitting the metadata change is safe.
+    impl->set_allow_tensor_metadata_change(true);
     impl->set_sizes_contiguous(full_shape);
     return at::Tensor(std::move(impl));
 }
@@ -413,6 +429,14 @@ inline at::Tensor nvl_multicast_bind_map(
         std::move(storage),
         c10::DispatchKeySet(c10::DispatchKey::CUDA),
         c10::scalarTypeToTypeMeta(at::kInt));
+    // This TensorImpl constructor is the one PyTorch uses for .data/.detach()
+    // views, so it leaves allow_tensor_metadata_change_ unset and
+    // set_sizes_contiguous() below raises on PyTorch 2.13:
+    //   "set_sizes_contiguous is not allowed on a Tensor created from .data
+    //    or .detach()".
+    // The tensor is freshly constructed here and owns its storage, so
+    // permitting the metadata change is safe.
+    impl->set_allow_tensor_metadata_change(true);
     impl->set_sizes_contiguous(shape);
     return at::Tensor(std::move(impl));
 }
