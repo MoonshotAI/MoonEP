@@ -191,17 +191,6 @@ torchrun --nproc_per_node=8 -m pytest tests/test_grad_reduce.py
 torchrun --nproc_per_node=8 -m pytest tests/test_prefetch.py
 ```
 
-The same tests run across nodes when the EP group stays inside one NVLink
-domain — launch them from the repo root on every node, e.g. for 2 nodes with
-4 GPUs each (`R = 8`):
-
-```bash
-# on each node, with --node_rank set to 0 and 1 respectively
-torchrun --nnodes=2 --node_rank=$NODE_RANK --nproc_per_node=4 \
-         --master_addr=$MASTER_ADDR --master_port=29500 \
-         -m pytest tests/test_planning.py
-```
-
 ## Acknowledgments
 
 This library is inspired by the following works:
