@@ -292,7 +292,6 @@ class GradReduceKernel:
         cd_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, STAGES)
         acc_tid = tidx - 32
         H_PER = cutlass.const_expr(TILE_ELEMS // ACC_THREADS)
-        #acc_reg = cute.make_rmem_tensor((H_PER,), Float32)
         acc_reg = cute.make_fragment((H_PER,), Float32)
 
         # ============ phase 1: warp-specialized accumulate, no clears ========
