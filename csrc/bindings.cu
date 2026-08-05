@@ -11,6 +11,7 @@ int64_t get_vmm_granularity() {
 }
 
 PYBIND11_MODULE(_C, m) {
+    m.attr("FABRIC_HANDLE_BYTES") = kFabricHandleBytes;
     m.def("nvl_dist_alloc", &nvl_dist_alloc,
           pybind11::arg("shape"), pybind11::arg("dtype"),
           pybind11::arg("use_fabric") = false,

@@ -125,8 +125,11 @@ class MoonEPRunner:
 
     def __init__(self, group, R, S, K, E, H, num_sms, hp=2048):
         from moonep import Buffer
-        from moonep._C import (nvl_dist_alloc, nvl_release_mem_handle,
-                               nvl_dist_map, get_vmm_granularity)
+        from moonep._C import (
+            FABRIC_HANDLE_BYTES as _FABRIC_HANDLE_BYTES,
+            nvl_dist_alloc, nvl_release_mem_handle,
+            nvl_dist_map, get_vmm_granularity
+        )
         from moonep.buffer import (_all_gather_shareables, _exchange_ipc_fds,
                                    _use_fabric_for_group)
         from moonep.planning import allocate_planning_outputs, launch_planning
@@ -177,27 +180,32 @@ class MoonEPRunner:
             for ka, owned in ((ka_w, w_owned), (ka_b, b_owned)):
                 self._keepalives.append(ka)
                 self._release(owned)
-            # exchange the expert chunk handles
+            # exchange the expert chunk handles, then append this rank's own
+            # buffer chunk as the trailing (R+1)-th chunk
             if self._use_fabric:
                 all_w = self._gather_shareables(w_sh, R, group)
                 full = self._dist_map(
                     chunk_shape=[self.epn, H, hp], dtype=dtype,
-                    shareables=all_w + [b_sh], local_rank=self.rank,
-                    world_size=R + 1, use_fabric=True)
+                    shareables=torch.cat(
+                        [all_w, b_sh.view(1, _FABRIC_HANDLE_BYTES)], dim=0),
+                    local_rank=self.rank, world_size=R + 1, use_fabric=True)
             else:
-                fds = self._exchange_fds(w_sh, list(range(R)), self.rank, R,
+                w_fd, b_fd = int(w_sh.item()), int(b_sh.item())
+                fds = self._exchange_fds(w_fd, list(range(R)), self.rank, R,
                                          group)
-                os.close(w_sh)
+                os.close(w_fd)
                 all_w_fds = [fds[r] for r in range(R)]
                 try:
                     full = self._dist_map(
                         chunk_shape=[self.epn, H, hp], dtype=dtype,
-                        shareables=all_w_fds + [b_sh], local_rank=self.rank,
-                        world_size=R + 1, use_fabric=False)
+                        shareables=torch.tensor(all_w_fds + [b_fd],
+                                                dtype=torch.int64),
+                        local_rank=self.rank, world_size=R + 1,
+                        use_fabric=False)
                 finally:
                     for fd in all_w_fds:
                         os.close(fd)
-                os.close(b_sh)
+                os.close(b_fd)
             return full
 
         # full_weight for the 3 projections (bf16). grad_reduce is not on the

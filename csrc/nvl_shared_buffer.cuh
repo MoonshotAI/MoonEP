@@ -5,7 +5,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 #include <tuple>
 #include <vector>
 
@@ -14,7 +13,6 @@
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <pybind11/pybind11.h>
 
 #ifndef CUCHECK
 #define CUCHECK(cmd) do {                                      \
@@ -137,42 +135,46 @@ static inline at::Tensor make_vmm_tensor(
     return at::Tensor(std::move(impl));
 }
 
-// Export an allocation (or multicast object) as the shareable form matching
-// `use_fabric`: a Python int holding a POSIX fd, or a 64-byte bytes object
-// holding a CUmemFabricHandle.
-static inline pybind11::object nvl_export_shareable(
+static constexpr int64_t kFabricHandleBytes =
+    static_cast<int64_t>(sizeof(CUmemFabricHandle::data));
+
+// Export an allocation (or multicast object) as a CPU tensor matching
+// `use_fabric`: uint8[64] holding a CUmemFabricHandle, or int64[] (a scalar
+// tensor) holding a POSIX fd.
+static inline at::Tensor nvl_export_shareable(
     CUmemGenericAllocationHandle handle, bool use_fabric
 ) {
     if (use_fabric) {
         CUmemFabricHandle fabric = {};
         CUCHECK(cuMemExportToShareableHandle(
             &fabric, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
-        return pybind11::bytes(
-            reinterpret_cast<const char *>(fabric.data), sizeof(fabric.data));
+        auto out = at::empty({kFabricHandleBytes},
+                             at::TensorOptions().dtype(at::kByte));
+        std::memcpy(out.data_ptr(), fabric.data, sizeof(fabric.data));
+        return out;
     }
     int fd = -1;
     CUCHECK(cuMemExportToShareableHandle(
         &fd, handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
     TORCH_CHECK(fd >= 0, "cuMemExportToShareableHandle returned invalid fd");
-    return pybind11::int_(fd);
+    return at::scalar_tensor(fd, at::TensorOptions().dtype(at::kLong));
 }
 
 // Import a peer's shareable handle produced by nvl_export_shareable.
 static inline CUmemGenericAllocationHandle nvl_import_shareable(
-    const pybind11::object &shareable, bool use_fabric
+    const at::Tensor &handles, int64_t index, bool use_fabric
 ) {
     CUmemGenericAllocationHandle handle;
     if (use_fabric) {
-        std::string blob = shareable.cast<std::string>();
         CUmemFabricHandle fabric = {};
-        TORCH_CHECK(blob.size() == sizeof(fabric.data),
-            "fabric handle must be ", sizeof(fabric.data), " bytes, got ",
-            blob.size());
-        std::memcpy(fabric.data, blob.data(), sizeof(fabric.data));
+        std::memcpy(fabric.data,
+                    handles.const_data_ptr<uint8_t>() + index * kFabricHandleBytes,
+                    sizeof(fabric.data));
         CUCHECK(cuMemImportFromShareableHandle(
             &handle, &fabric, CU_MEM_HANDLE_TYPE_FABRIC));
     } else {
-        int fd = shareable.cast<int>();
+        int64_t fd = handles.const_data_ptr<int64_t>()[index];
+        TORCH_CHECK(fd >= 0, "invalid fd ", fd, " at index ", index);
         CUCHECK(cuMemImportFromShareableHandle(
             &handle, reinterpret_cast<void *>(static_cast<intptr_t>(fd)),
             CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
@@ -185,9 +187,10 @@ static inline CUmemGenericAllocationHandle nvl_import_shareable(
 // the caller must call nvl_release_mem_handle when done (buffers that do not need
 // multicast release it immediately, matching the old behavior; buffers that need
 // multicast release it after bind).
-// The shareable handle is what peers import: an fd the caller must close once
-// all peers have imported it, or a 64-byte fabric blob that needs no cleanup.
-inline std::tuple<at::Tensor, pybind11::object, int64_t> nvl_dist_alloc(
+// The shareable handle is what peers import: an int64 scalar tensor holding an
+// fd the caller must close once all peers have imported it, or a uint8[64]
+// fabric handle that needs no cleanup.
+inline std::tuple<at::Tensor, at::Tensor, int64_t> nvl_dist_alloc(
     const std::vector<int64_t> &chunk_shape,
     at::ScalarType dtype,
     bool use_fabric
@@ -247,14 +250,11 @@ static inline void nvl_release_mem_handle(int64_t mem_handle_u64) {
 inline at::Tensor nvl_dist_map(
     const std::vector<int64_t> &chunk_shape,
     at::ScalarType dtype,
-    const std::vector<pybind11::object> &shareables,
+    const at::Tensor &shareables,
     int64_t local_rank,
     int64_t world_size,
     bool use_fabric
 ) {
-    TORCH_CHECK((int64_t)shareables.size() == world_size,
-        "shareables.size()=", shareables.size(), " != world_size=", world_size);
-
     auto [chunk_nbytes, chunk_allocated_size, device_id] =
         nvl_prepare(chunk_shape, dtype, use_fabric);
 
@@ -271,7 +271,7 @@ inline at::Tensor nvl_dist_map(
 
     for (int64_t i = 0; i < world_size; i++) {
         CUmemGenericAllocationHandle mem_handle =
-            nvl_import_shareable(shareables[i], use_fabric);
+            nvl_import_shareable(shareables, i, use_fabric);
 
         CUdeviceptr chunk_va = dptr + i * chunk_allocated_size;
         CUCHECK(cuMemMap(chunk_va, chunk_allocated_size, 0, mem_handle, 0));
@@ -393,7 +393,7 @@ static inline int64_t get_multicast_granularity(int64_t num_devices) {
 // mc_handle is a handle value valid within this process; Python holds it and
 // passes it back unchanged to bind_map. The caller passes the shareable handle
 // to the other ranks (closing the fd, if it is one, after all have imported).
-inline std::tuple<int64_t, pybind11::object> nvl_multicast_create(
+inline std::tuple<int64_t, at::Tensor> nvl_multicast_create(
     int64_t size_bytes, int64_t num_devices, bool use_fabric
 ) {
     TORCH_CHECK(nvl_multicast_supported(),
@@ -418,9 +418,11 @@ inline std::tuple<int64_t, pybind11::object> nvl_multicast_create(
 // non-root: import the multicast object from the handle sent by root. If it is
 // an fd, the caller may close it once imported.
 inline int64_t nvl_multicast_import(
-    const pybind11::object &shareable, bool use_fabric
+    const at::Tensor &shareable, bool use_fabric
 ) {
-    return static_cast<int64_t>(nvl_import_shareable(shareable, use_fabric));
+    auto one = use_fabric ? shareable.view({1, kFabricHandleBytes})
+                          : shareable.view({1});
+    return static_cast<int64_t>(nvl_import_shareable(one, 0, use_fabric));
 }
 
 // all ranks: add this rank's device to the multicast group. Must happen before
