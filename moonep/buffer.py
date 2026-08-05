@@ -1,3 +1,4 @@
+import functools
 import os
 import shutil
 import socket
@@ -34,10 +35,8 @@ _ELEM_SIZE = {
 _HANDLE_TYPE_ENV = "MOONEP_MEM_HANDLE_TYPE"
 
 
-def _use_fabric_for_group(
-    world_size: int,
-    group: dist.ProcessGroup | None,
-) -> bool:
+@functools.lru_cache(maxsize=None)
+def _use_fabric_for_group(group: dist.ProcessGroup | None) -> bool:
     mode = os.environ.get(_HANDLE_TYPE_ENV, "auto").lower()
     assert mode in ("auto", "fabric", "fd"), (
         f"{_HANDLE_TYPE_ENV} must be one of auto/fabric/fd, got {mode!r}"
@@ -46,7 +45,9 @@ def _use_fabric_for_group(
         return False
 
     supported = bool(nvl_fabric_supported())
-    if world_size == 1 or not dist.is_available() or not dist.is_initialized():
+    world_size = (dist.get_world_size(group=group)
+                  if dist.is_available() and dist.is_initialized() else 1)
+    if world_size == 1:
         unsupported = [] if supported else [0]
     else:
         local = torch.tensor([supported], dtype=torch.uint8, device="cuda")
@@ -66,11 +67,10 @@ def _use_fabric_for_group(
 
 def _all_gather_shareables(
     local_handle: torch.Tensor,
-    world_size: int,
     group: dist.ProcessGroup | None,
 ) -> torch.Tensor:
-    """Gather every rank's fabric handle into a uint8[world_size, 64] CPU tensor.
-    """
+    """Gather every rank's fabric handle into a uint8[world_size, 64] CPU tensor."""
+    world_size = dist.get_world_size(group=group)
     gathered = torch.empty(world_size, _FABRIC_HANDLE_BYTES,
                            dtype=torch.uint8, device="cuda")
     dist.all_gather_into_tensor(
@@ -192,7 +192,7 @@ def _map_nvl_dist_tensor(
     use_fabric: bool,
 ) -> torch.Tensor:
     if use_fabric:
-        shareables = _all_gather_shareables(shareable, world_size, group)
+        shareables = _all_gather_shareables(shareable, group)
         full_tensor = nvl_dist_map(
             chunk_shape=chunk_shape,
             dtype=dtype,
@@ -238,7 +238,7 @@ def create_nvl_dist_tensor(
     `local_rank` and `world_size` must match the given `group` (or the default
     group when `group is None`). All ranks in the group exchange memory handles.
     """
-    use_fabric = _use_fabric_for_group(world_size, group)
+    use_fabric = _use_fabric_for_group(group)
     keepalive, shareable, owned_handle = nvl_dist_alloc(
         shape=chunk_shape, dtype=dtype, use_fabric=use_fabric)
     try:
@@ -266,7 +266,7 @@ def create_nvl_dist_multicast_tensor(
     The owned allocation handle needed by `cuMulticastBindMem` stays internal to
     this helper and is released after both mappings have been created.
     """
-    use_fabric = _use_fabric_for_group(world_size, group)
+    use_fabric = _use_fabric_for_group(group)
     keepalive, shareable, owned_handle = nvl_dist_alloc(
         shape=chunk_shape, dtype=dtype, use_fabric=use_fabric)
     try:
@@ -359,7 +359,7 @@ def create_nvl_single_owner_tensor(
     (use pad_dim0_for_alignment).
     """
     world_size = dist.get_world_size(group=group)
-    use_fabric = _use_fabric_for_group(world_size, group)
+    use_fabric = _use_fabric_for_group(group)
     is_owner = local_rank == owner_rank
 
     if is_owner:

@@ -136,7 +136,7 @@ class MoonEPRunner:
         from moonep.inter_rank_sync import launch_inter_rank_sync
         self._launch_planning = launch_planning
         self._launch_sync = launch_inter_rank_sync
-        self._use_fabric = _use_fabric_for_group(R, group)
+        self._use_fabric = _use_fabric_for_group(group)
         self._alloc_chunk = lambda shape, dtype: nvl_dist_alloc(
             shape=shape, dtype=dtype, use_fabric=self._use_fabric)
         self._release = nvl_release_mem_handle
@@ -183,7 +183,7 @@ class MoonEPRunner:
             # exchange the expert chunk handles, then append this rank's own
             # buffer chunk as the trailing (R+1)-th chunk
             if self._use_fabric:
-                all_w = self._gather_shareables(w_sh, R, group)
+                all_w = self._gather_shareables(w_sh, group)
                 full = self._dist_map(
                     chunk_shape=[self.epn, H, hp], dtype=dtype,
                     shareables=torch.cat(

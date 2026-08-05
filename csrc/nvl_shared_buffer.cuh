@@ -160,7 +160,27 @@ static inline at::Tensor nvl_export_shareable(
     return at::scalar_tensor(fd, at::TensorOptions().dtype(at::kLong));
 }
 
-// Import a peer's shareable handle produced by nvl_export_shareable.
+static inline void nvl_check_handles(
+    const at::Tensor &handles, int64_t world_size, bool use_fabric
+) {
+    TORCH_CHECK(handles.device().is_cpu() && handles.is_contiguous(),
+        "shareable handles must be a contiguous CPU tensor, got device=",
+        handles.device(), " contiguous=", handles.is_contiguous());
+    if (use_fabric) {
+        TORCH_CHECK(handles.scalar_type() == at::kByte && handles.dim() == 2
+                    && handles.size(0) == world_size
+                    && handles.size(1) == kFabricHandleBytes,
+            "fabric handles must be uint8[", world_size, ", ",
+            kFabricHandleBytes, "], got ", handles.scalar_type(), handles.sizes());
+    } else {
+        TORCH_CHECK(handles.scalar_type() == at::kLong
+                    && handles.numel() == world_size,
+            "fd handles must be int64 with ", world_size, " elements, got ",
+            handles.scalar_type(), handles.sizes());
+    }
+}
+
+// Import row `index` of a handle tensor already validated by nvl_check_handles.
 static inline CUmemGenericAllocationHandle nvl_import_shareable(
     const at::Tensor &handles, int64_t index, bool use_fabric
 ) {
@@ -255,6 +275,8 @@ inline at::Tensor nvl_dist_map(
     int64_t world_size,
     bool use_fabric
 ) {
+    nvl_check_handles(shareables, world_size, use_fabric);
+
     auto [chunk_nbytes, chunk_allocated_size, device_id] =
         nvl_prepare(chunk_shape, dtype, use_fabric);
 
@@ -422,6 +444,7 @@ inline int64_t nvl_multicast_import(
 ) {
     auto one = use_fabric ? shareable.view({1, kFabricHandleBytes})
                           : shareable.view({1});
+    nvl_check_handles(one, 1, use_fabric);
     return static_cast<int64_t>(nvl_import_shareable(one, 0, use_fabric));
 }
 
