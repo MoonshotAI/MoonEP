@@ -70,7 +70,7 @@ setup(
     version="0.0.1",
     packages=find_packages(include=["moonep", "moonep.*"]),
     install_requires=[
-        "nvidia-cutlass-dsl==4.4.2",
+        "nvidia-cutlass-dsl==4.6.0",
     ],
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
