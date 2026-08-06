@@ -1,4 +1,3 @@
-import functools
 import os
 import shutil
 import socket
@@ -35,7 +34,6 @@ _ELEM_SIZE = {
 _HANDLE_TYPE_ENV = "MOONEP_MEM_HANDLE_TYPE"
 
 
-@functools.lru_cache(maxsize=None)
 def _use_fabric_for_group(group: dist.ProcessGroup | None) -> bool:
     mode = os.environ.get(_HANDLE_TYPE_ENV, "auto").lower()
     assert mode in ("auto", "fabric", "fd"), (
