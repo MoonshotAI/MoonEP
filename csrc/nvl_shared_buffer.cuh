@@ -47,8 +47,22 @@ static inline bool nvl_fabric_supported() {
     CUresult err = cuDeviceGetAttribute(&supported,
         CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, cu_device);
     // Older drivers do not know the attribute at all.
-    if (err != CUDA_SUCCESS) return false;
-    return supported != 0;
+    if (err != CUDA_SUCCESS || !supported) return false;
+
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device_id;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+    size_t size;
+    if (cuMemGetAllocationGranularity(
+            &size, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS)
+        return false;
+
+    CUmemGenericAllocationHandle handle;
+    if (cuMemCreate(&handle, size, &prop, 0) != CUDA_SUCCESS) return false;
+    CUCHECK(cuMemRelease(handle));
+    return true;
 }
 
 static inline size_t nvl_granularity_for(int device_id,
