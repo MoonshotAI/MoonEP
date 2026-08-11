@@ -22,12 +22,6 @@ from moonep._C import (
     nvl_multicast_bind_map,
 )
 
-_ELEM_SIZE = {
-    torch.float32: 4,
-    torch.bfloat16: 2,
-    torch.int32: 4,
-}
-
 # How VMM allocations are shared between the ranks of an EP group. "auto" (the
 # default) picks fabric handles when the group spans more than one node and the
 # device supports them, and POSIX fds otherwise; "fabric" / "fd" force one.
@@ -103,8 +97,7 @@ def pad_dim0_for_alignment(chunk_shape: list[int], dtype: torch.dtype) -> int:
 
     Returns the padded dim0 value (>= chunk_shape[0]).
     """
-    elem_size = _ELEM_SIZE[dtype]
-    inner_size = elem_size
+    inner_size = dtype.itemsize
     for d in chunk_shape[1:]:
         inner_size *= d  # bytes per row
 

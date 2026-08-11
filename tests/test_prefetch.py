@@ -29,6 +29,9 @@ from moonep.prefetch import launch_prefetch
 from tests.kernel_test_utils import local_device_index
 
 
+K3_H, K3_I = 3584, 3072
+
+
 def _random_experts(E, B, seed):
     """Random plan with ~40% holes and possible duplicates. Local to each
     rank's launch, so it doesn't need to agree across ranks; seeding keeps
@@ -120,6 +123,52 @@ CASES = [
         "owner_offset": 1,
         "experts": lambda E: [E - 1, 98, -1],
     },
+    # ---- Quantized experts -------------------------------------------------
+    {
+        "name": "mxfp4_packed_k3_gate_up",
+        "E": 8,
+        "H": 2 * K3_I, 
+        "Hp": K3_H // 2,
+        "B": 3,
+        "num_sms": 32,
+        "owner_offset": 1,
+        "dtype": torch.uint8,
+        "experts": lambda E: [E - 1, 0, -1],
+    },
+    {
+        "name": "mxfp4_packed_k3_down",
+        "E": 8,
+        "H": K3_H, 
+        "Hp": K3_I // 2, 
+        "B": 4,
+        "num_sms": 32,
+        "owner_offset": 2,
+        "dtype": torch.uint8,
+        "experts": lambda E: [1, E - 1, 1, -1], 
+    },
+    # ue8m0 block scales, re-tiled.
+    {
+        "name": "mxfp4_sf_k3_gate_up_retiled",
+        "E": 8,
+        "H": 128,
+        "Hp": 2 * K3_I * K3_H // 32 // 128,
+        "B": 4,
+        "num_sms": 16,
+        "owner_offset": 1,
+        "dtype": torch.uint8,
+        "experts": lambda E: [E - 1, 2, 2, -1],
+    },
+    {
+        "name": "mxfp4_sf_k3_down_retiled",
+        "E": 8,
+        "H": 128,
+        "Hp": K3_H * K3_I // 32 // 128,
+        "B": 3,
+        "num_sms": 16,
+        "owner_offset": 3,
+        "dtype": torch.uint8,
+        "experts": lambda E: [0, E - 1, -1],
+    },
     # Random plans (holes, duplicates, uneven coverage) at B=16.
     {
         "name": "random_plan_s1",
@@ -177,24 +226,36 @@ def dist_env():
         dist.destroy_process_group()
 
 
-def make_single_owner_experts(rank, R, E, H, Hp):
+def _fill_random(shape, dtype, gen):
+    if dtype.is_floating_point:
+        return torch.randn(shape, dtype=dtype, device="cuda", generator=gen)
+    info = torch.iinfo(dtype)
+    return torch.randint(
+        info.min, info.max, shape, dtype=dtype, device="cuda", generator=gen
+    )
+
+
+def _sentinel_for(dtype):
+    if dtype.is_floating_point:
+        return -123.0
+    return 0xAB if dtype == torch.uint8 else 123
+
+
+def make_single_owner_experts(rank, R, E, H, Hp, dtype=torch.bfloat16):
     """Create one VMM mapped expert tensor per physical owner GPU."""
-    padded_E = pad_dim0_for_alignment([E, H, Hp], torch.bfloat16)
+    padded_E = pad_dim0_for_alignment([E, H, Hp], dtype)
     owners = []
     for owner in range(R):
         mapped = create_nvl_single_owner_tensor(
             [padded_E, H, Hp],
-            torch.bfloat16,
+            dtype,
             owner_rank=owner,
             local_rank=rank,
         )
         if rank == owner:
             seed = 2026 + owner + E * 13 + H * 17 + Hp * 19
             gen = torch.Generator(device="cuda").manual_seed(seed)
-            mapped[:E].copy_(
-                torch.randn(E, H, Hp, dtype=torch.bfloat16,
-                            device="cuda", generator=gen)
-            )
+            mapped[:E].copy_(_fill_random((E, H, Hp), dtype, gen))
             if padded_E > E:
                 mapped[E:].zero_()
         torch.cuda.synchronize()
@@ -216,12 +277,13 @@ def run_case(rank, R, case):
     Hp = case["Hp"]
     B = case["B"]
     num_sms = case["num_sms"]
+    dtype = case.get("dtype", torch.bfloat16)
     dev = "cuda"
 
     assert H % 128 == 0 and Hp % 128 == 0, \
         f"{case['name']}: H/Hp must be multiples of 128"
 
-    all_remote = make_single_owner_experts(rank, R, E, H, Hp)
+    all_remote = make_single_owner_experts(rank, R, E, H, Hp, dtype)
     remote_owner = remote_owner_for(rank, R, case["owner_offset"])
     remote_expert = all_remote[remote_owner]
     assert remote_owner != rank, f"{case['name']}: remote owner must not be local"
@@ -230,10 +292,8 @@ def run_case(rank, R, case):
     expert_ids = case["experts"](E)
     assert len(expert_ids) == B
     experts_to_copy = torch.tensor(expert_ids, dtype=torch.int32, device=dev)
-    sentinel = -123.0
-    prefetch_buffers = torch.full(
-        (B, H, Hp), sentinel, dtype=torch.bfloat16, device=dev
-    )
+    sentinel = _sentinel_for(dtype)
+    prefetch_buffers = torch.full((B, H, Hp), sentinel, dtype=dtype, device=dev)
 
     launch_prefetch(remote_expert, prefetch_buffers, experts_to_copy, num_sms=num_sms)
     torch.cuda.synchronize()
@@ -266,7 +326,7 @@ def run_case(rank, R, case):
     if rank == 0:
         print(
             f"  [PASS] {case['name']}: E={E}, B={B}, "
-            f"H={H}, Hp={Hp}, num_sms={num_sms}"
+            f"H={H}, Hp={Hp}, dtype={dtype}, num_sms={num_sms}"
         )
 
     dist.barrier(device_ids=[local_device_index()])

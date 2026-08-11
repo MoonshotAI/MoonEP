@@ -8,8 +8,11 @@ pipeline:
   - warp 0: GMEM -> SMEM 2D TMA load
   - warp 1: SMEM -> GMEM 2D TMA store
 
-The initial tile shape is fixed at 128 x 128 bf16 elements.  H and H' are
+The initial tile shape is fixed at 128 x 128 elements.  H and H' are
 therefore required to be multiples of 128 for this first implementation.
+For a scale tensor whose natural trailing extent is K/32 (never a
+multiple of 128), re-tile its contiguous per-expert byte range to
+``[128, nbytes // 128]`` before calling in.
 """
 
 import functools
@@ -22,8 +25,15 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.cute.nvgpu.cpasync as cpasync
-from cutlass import BFloat16, Int32, Int64
+from cutlass import BFloat16, Int8, Int32, Int64, Uint8
 from cutlass.cute.runtime import make_ptr
+
+
+_ELEM_TYPES = {
+    torch.bfloat16: (BFloat16, 2),
+    torch.int8: (Int8, 1),
+    torch.uint8: (Uint8, 1),
+}
 
 
 class PrefetchKernel:
@@ -43,25 +53,29 @@ class PrefetchKernel:
         B: int,
         num_sms: int,
         smem_budget: int,
+        elem_ty=BFloat16,
+        elem_bytes: int = 2,
     ):
         self.E = E
         self.H = H
         self.Hp = Hp
         self.B = B
         self.num_sms = num_sms
+        self.elem_ty = elem_ty
+        self.elem_bytes = elem_bytes
         self.stages = self._pick_stages(smem_budget)
         if self.stages == 0:
             raise RuntimeError(
                 "prefetch: not enough per-block shared memory for one "
-                f"{self.M_BLOCK}x{self.N_BLOCK} bf16 tile under budget "
-                f"{smem_budget} B"
+                f"{self.M_BLOCK}x{self.N_BLOCK} x {elem_bytes}B tile under "
+                f"budget {smem_budget} B"
             )
 
     def _smem_bytes(self, stages: int) -> int:
         def _round_up(n: int, a: int) -> int:
             return (n + a - 1) // a * a
 
-        tile_bytes = self.M_BLOCK * self.N_BLOCK * 2
+        tile_bytes = self.M_BLOCK * self.N_BLOCK * self.elem_bytes
         return (
             _round_up(stages * tile_bytes, 128)
             + _round_up(stages * 2 * 8, 16)
@@ -78,8 +92,8 @@ class PrefetchKernel:
     @cute.jit
     def __call__(
         self,
-        remote_expert_ptr: cute.Pointer,    # bf16 [E, H, H']
-        prefetch_buf_ptr: cute.Pointer,     # bf16 [B, H, H']
+        remote_expert_ptr: cute.Pointer,    # elem_ty [E, H, H']
+        prefetch_buf_ptr: cute.Pointer,     # elem_ty [B, H, H']
         experts_ptr: cute.Pointer,          # int32 [B]
         stream: cuda.CUstream,
     ):
@@ -151,7 +165,7 @@ class PrefetchKernel:
         M_BLOCK = cutlass.const_expr(self.M_BLOCK)
         N_BLOCK = cutlass.const_expr(self.N_BLOCK)
         TILE_ELEMS = cutlass.const_expr(M_BLOCK * N_BLOCK)
-        TILE_BYTES = cutlass.const_expr(TILE_ELEMS * 2)
+        TILE_BYTES = cutlass.const_expr(TILE_ELEMS * self.elem_bytes)
         MTILES = cutlass.const_expr(H // M_BLOCK)
         NTILES = cutlass.const_expr(Hp // N_BLOCK)
         TILES_PER_EXPERT = cutlass.const_expr(MTILES * NTILES)
@@ -164,7 +178,7 @@ class PrefetchKernel:
         exp_tab = smem.allocate_tensor(Int32, cute.make_layout((B,)), byte_alignment=4)
         slot_tab = smem.allocate_tensor(Int32, cute.make_layout((B,)), byte_alignment=4)
         stage_smem = smem.allocate_tensor(
-            BFloat16,
+            self.elem_ty,
             cute.make_ordered_layout(
                 (M_BLOCK, N_BLOCK, stages),
                 order=(1, 0, 2),
@@ -290,7 +304,9 @@ def _get_compiled(
     B: int,
     num_sms: int,
     device_index: int,
+    torch_dtype: torch.dtype,
 ):
+    elem_ty, elem_bytes = _ELEM_TYPES[torch_dtype]
     smem_budget = _max_smem_per_block_optin(device_index) - 1024
     kernel = PrefetchKernel(
         E=E,
@@ -299,19 +315,43 @@ def _get_compiled(
         B=B,
         num_sms=num_sms,
         smem_budget=smem_budget,
+        elem_ty=elem_ty,
+        elem_bytes=elem_bytes,
     )
 
-    bf16_ptr = make_ptr(BFloat16, 0, cute.AddressSpace.gmem, assumed_align=16)
+    data_ptr = make_ptr(elem_ty, 0, cute.AddressSpace.gmem, assumed_align=16)
     i32_ptr = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=4)
     stream_arg = cuda.CUstream(0)
 
     return cute.compile(
         kernel,
-        bf16_ptr,
-        bf16_ptr,
+        data_ptr,
+        data_ptr,
         i32_ptr,
         stream_arg,
     )
+
+
+def prefetch_retile_nbytes(per_expert_nbytes: int) -> int:
+    """Round a per-expert byte count up to what ``retile_for_prefetch`` needs.
+    """
+    tile = PrefetchKernel.M_BLOCK * PrefetchKernel.N_BLOCK
+    return (per_expert_nbytes + tile - 1) // tile * tile
+
+
+def retile_for_prefetch(t: torch.Tensor) -> torch.Tensor:
+    """View a contiguous ``[N, ...]`` expert tensor as ``[N, 128, X]`` uint8.
+    """
+    assert t.is_contiguous(), "retile_for_prefetch requires a contiguous tensor"
+    n = int(t.shape[0])
+    per_expert = t.nbytes // n if n else 0
+    tile = PrefetchKernel.M_BLOCK * PrefetchKernel.N_BLOCK
+    assert per_expert % tile == 0, (
+        f"retile_for_prefetch: per-expert extent {per_expert} bytes is not a "
+        f"multiple of {tile}; allocate {prefetch_retile_nbytes(per_expert)} "
+        f"bytes per expert instead"
+    )
+    return t.view(torch.uint8).reshape(n, PrefetchKernel.M_BLOCK, -1)
 
 
 def launch_prefetch(
@@ -323,8 +363,10 @@ def launch_prefetch(
     """Launch remote expert prefetch.
 
     Args:
-        remote_expert: contiguous bf16 tensor shaped [E, H, H'].
-        prefetch_buffers: contiguous bf16 tensor shaped [B, H, H'].
+        remote_expert: contiguous tensor shaped [E, H, H'].  dtype must be one
+            of ``_ELEM_TYPES`` -- the copy is type-agnostic, so packed MXFP4
+            (uint8) and ue8m0 scales (uint8) go through the same path as bf16.
+        prefetch_buffers: contiguous tensor shaped [B, H, H'], same dtype.
         experts_to_copy: contiguous int32 tensor shaped [B].  Entries are
             expert ids in [0, E), or -1 for unused slots.  Unused slots are
             not written by this kernel.
@@ -333,10 +375,16 @@ def launch_prefetch(
     if prefetch_buffers.numel() == 0 or experts_to_copy.numel() == 0:
         return
 
-    assert remote_expert.dtype == torch.bfloat16 and remote_expert.is_contiguous(), \
-        "remote_expert must be contiguous bf16 [E, H, H']"
-    assert prefetch_buffers.dtype == torch.bfloat16 and prefetch_buffers.is_contiguous(), \
-        "prefetch_buffers must be contiguous bf16 [B, H, H']"
+    dtype = remote_expert.dtype
+    assert dtype in _ELEM_TYPES, (
+        f"prefetch: unsupported dtype {dtype}; "
+        f"supported: {sorted(str(d) for d in _ELEM_TYPES)}"
+    )
+    assert remote_expert.is_contiguous(), \
+        "remote_expert must be contiguous [E, H, H']"
+    assert prefetch_buffers.dtype == dtype and prefetch_buffers.is_contiguous(), \
+        f"prefetch_buffers must be contiguous [B, H, H'] with dtype {dtype}, " \
+        f"got {prefetch_buffers.dtype}"
     assert experts_to_copy.dtype == torch.int32 and experts_to_copy.is_contiguous(), \
         "experts_to_copy must be contiguous int32 [B]"
     assert remote_expert.ndim == 3, \
@@ -360,16 +408,17 @@ def launch_prefetch(
     assert experts_to_copy.device.index == device_index, \
         "experts_to_copy must be on the same CUDA device as prefetch_buffers"
 
-    compiled = _get_compiled(E, H, Hp, B, int(num_sms), int(device_index))
+    compiled = _get_compiled(E, H, Hp, B, int(num_sms), int(device_index), dtype)
 
+    elem_ty, _ = _ELEM_TYPES[dtype]
     src_ptr = make_ptr(
-        BFloat16,
+        elem_ty,
         remote_expert.data_ptr(),
         cute.AddressSpace.gmem,
         assumed_align=16,
     )
     dst_ptr = make_ptr(
-        BFloat16,
+        elem_ty,
         prefetch_buffers.data_ptr(),
         cute.AddressSpace.gmem,
         assumed_align=16,

@@ -68,7 +68,7 @@ from .dispatch import launch_dispatch
 from .dispatch_epilogue import launch_dispatch_epilogue
 from .combine import launch_combine
 from .combine_prologue import launch_combine_prologue
-from .prefetch import launch_prefetch
+from .prefetch import _ELEM_TYPES, launch_prefetch, retile_for_prefetch
 from .grad_reduce import launch_grad_reduce
 
 logger = logging.getLogger(__name__)
@@ -161,6 +161,7 @@ def _launch_full_weight_prefetches(
     full_up_weight: torch.Tensor,
     full_down_weight: torch.Tensor,
     experts_to_copy: torch.Tensor,
+    scales: tuple[torch.Tensor, ...] | None = None,
 ) -> None:
     E = int(ctx['E'])
     num_sms = int(ctx['num_sms'])
@@ -168,6 +169,14 @@ def _launch_full_weight_prefetches(
         launch_prefetch(
             full_weight[:E],
             full_weight[E:],
+            experts_to_copy,
+            num_sms=num_sms,
+        )
+    for full_scale in scales or ():
+        tiled = retile_for_prefetch(full_scale)
+        launch_prefetch(
+            tiled[:E],
+            tiled[E:],
             experts_to_copy,
             num_sms=num_sms,
         )
@@ -675,11 +684,13 @@ class Buffer:
         ctx: dict,
         experts_to_copy: torch.Tensor,
         weight_prefetch_args,
+        scale_prefetch_args=None,
     ) -> None:
         _launch_full_weight_prefetches(
             ctx,
             *weight_prefetch_args,
             experts_to_copy[int(ctx['rank'])],
+            scales=scale_prefetch_args,
         )
 
     def dispatch(
@@ -821,6 +832,9 @@ class Buffer:
         full_gate_weight: torch.Tensor | None = None,
         full_up_weight: torch.Tensor | None = None,
         full_down_weight: torch.Tensor | None = None,
+        full_gate_scale: torch.Tensor | None = None,
+        full_up_scale: torch.Tensor | None = None,
+        full_down_scale: torch.Tensor | None = None,
     ):
         """Prefetch the remote expert weights selected by ``plan`` into the
         local prefetch slots (dispatch fwd, weight side).
@@ -829,9 +843,14 @@ class Buffer:
             plan: MoonEPCommPlan returned by ``dispatch``.
             async_finish: run on the comm stream and return a CUDA event.
             full_gate_weight / full_up_weight / full_down_weight:
-                [E+B, H, H'] bf16 contiguous weight tensors; rows [0, E) are
-                source expert weights, rows [E, E+B) are the prefetch slots
-                filled by this call.
+                [E+B, H, H'] contiguous weight tensors; rows [0, E) are source
+                expert weights, rows [E, E+B) are the prefetch slots filled by
+                this call. bf16 for unquantized experts, uint8 for MXFP4 (e2m1
+                packs two values per byte, so H' is K/2).
+            full_gate_scale / full_up_scale / full_down_scale:
+                optional [E+B, ...] contiguous block-scale tensors, same row
+                convention. Required for quantized experts and omitted for bf16
+                ones.
 
         Returns:
             None in synchronous mode, or the comm-stream CUDA event when
@@ -849,14 +868,27 @@ class Buffer:
         assert all(w is not None for w in weight_prefetch_args), \
             "prefetch_weight tensors must be provided together"
         for w in weight_prefetch_args:
-            assert w.dtype == torch.bfloat16 and w.is_contiguous()
+            assert w.dtype in _ELEM_TYPES, \
+                f"prefetch_weight: unsupported weight dtype {w.dtype}"
+            assert w.is_contiguous()
             assert w.ndim == 3 and int(w.shape[0]) == int(ctx['E']) + int(ctx['B'])
+
+        scale_prefetch_args = (full_gate_scale, full_up_scale, full_down_scale)
+        if any(s is not None for s in scale_prefetch_args):
+            assert all(s is not None for s in scale_prefetch_args), \
+                "prefetch_weight scales must be provided together"
+            for s in scale_prefetch_args:
+                assert s.is_contiguous()
+                assert s.ndim >= 2 and int(s.shape[0]) == int(ctx['E']) + int(ctx['B'])
+        else:
+            scale_prefetch_args = None
 
         if not async_finish:
             self._run_prefetch_weight_on_current_stream(
                 ctx,
                 plan.experts_to_copy,
                 weight_prefetch_args,
+                scale_prefetch_args,
             )
             return None
 
@@ -864,7 +896,10 @@ class Buffer:
         comm = self._comm_stream
         assert comm is not None, "MoonEP Buffer communication stream is not initialized"
 
-        self._record_streams((plan.experts_to_copy, *weight_prefetch_args), comm)
+        self._record_streams(
+            (plan.experts_to_copy, *weight_prefetch_args, *(scale_prefetch_args or ())),
+            comm,
+        )
         input_ready = main_stream.record_event()
         comm.wait_event(input_ready)
 
@@ -873,6 +908,7 @@ class Buffer:
                 ctx,
                 plan.experts_to_copy,
                 weight_prefetch_args,
+                scale_prefetch_args,
             )
             done = comm.record_event()
 
