@@ -172,6 +172,25 @@ def _exchange_ipc_fds(
     return fds
 
 
+def local_first_chunk_index(owner_rank: int, local_rank: int, world_size: int) -> int:
+    """Which chunk of a ``local_first=True`` mapping holds ``owner_rank``'s data.
+    The mapping is rotated so the caller's own chunk sits at index 0, which
+    makes every rank's chunk indices differ. That is fine for indices computed
+    locally, and it is what lets consumers that resolve a tensor's device from
+    its base pointer -- DeepGEMM's tvm_ffi bindings, for one -- see the local
+    device rather than rank 0's.
+    """
+    return (owner_rank - local_rank) % world_size
+
+
+def _rotate_local_first(shareables, local_rank: int, world_size: int):
+    """Reorder handles so the local rank's chunk is mapped first."""
+    order = [(local_rank + i) % world_size for i in range(world_size)]
+    if isinstance(shareables, torch.Tensor):
+        return shareables[order]
+    return [shareables[i] for i in order]
+
+
 def _map_nvl_dist_tensor(
     chunk_shape: list[int],
     dtype: torch.dtype,
@@ -181,9 +200,12 @@ def _map_nvl_dist_tensor(
     world_size: int,
     group: dist.ProcessGroup | None,
     use_fabric: bool,
+    local_first: bool = False,
 ) -> torch.Tensor:
     if use_fabric:
         shareables = _all_gather_shareables(shareable, group)
+        if local_first:
+            shareables = _rotate_local_first(shareables, local_rank, world_size)
         full_tensor = nvl_dist_map(
             chunk_shape=chunk_shape,
             dtype=dtype,
@@ -198,6 +220,8 @@ def _map_nvl_dist_tensor(
                                 local_rank, world_size, group)
         os.close(local_fd)
         all_fds = [fds[r] for r in range(world_size)]
+        if local_first:
+            all_fds = _rotate_local_first(all_fds, local_rank, world_size)
         try:
             full_tensor = nvl_dist_map(
                 chunk_shape=chunk_shape,
@@ -220,6 +244,7 @@ def create_nvl_dist_tensor(
     local_rank: int,
     world_size: int,
     group: dist.ProcessGroup | None = None,
+    local_first: bool = False,
 ) -> torch.Tensor:
     """Allocate an NVLink distributed tensor with all-RW access.
 
@@ -228,6 +253,12 @@ def create_nvl_dist_tensor(
 
     `local_rank` and `world_size` must match the given `group` (or the default
     group when `group is None`). All ranks in the group exchange memory handles.
+
+    By default chunk ``i`` holds rank ``i``'s data, the same on every rank.
+    With ``local_first=True`` the mapping is rotated so the caller's own chunk
+    comes first; use ``local_first_chunk_index()`` to locate an owner. Prefer
+    that when the tensor is handed to a library that infers its device from the
+    base pointer, which otherwise resolves to rank 0's GPU on every rank.
     """
     use_fabric = _use_fabric_for_group(group)
     keepalive, shareable, owned_handle = nvl_dist_alloc(
@@ -236,6 +267,7 @@ def create_nvl_dist_tensor(
         return _map_nvl_dist_tensor(
             chunk_shape, dtype, shareable, keepalive,
             local_rank, world_size, group, use_fabric,
+            local_first=local_first,
         )
     finally:
         nvl_release_mem_handle(owned_handle)

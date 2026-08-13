@@ -50,6 +50,7 @@ Usage:
 import logging
 import os
 import warnings
+from collections.abc import Sequence
 
 import torch
 import torch.distributed as dist
@@ -157,29 +158,62 @@ def _log_context_buffer_size(ctx: dict) -> None:
 
 def _launch_full_weight_prefetches(
     ctx,
-    full_gate_weight: torch.Tensor,
-    full_up_weight: torch.Tensor,
-    full_down_weight: torch.Tensor,
+    weight_pairs: tuple[tuple[torch.Tensor, torch.Tensor], ...],
     experts_to_copy: torch.Tensor,
-    scales: tuple[torch.Tensor, ...] | None = None,
+    scale_pairs: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
 ) -> None:
-    E = int(ctx['E'])
+    """Copy the planned remote experts into this rank's slots, one launch per
+    projection (and one more per scale when the experts are quantized).
+    Each pair is (source, slots).
+    """
     num_sms = int(ctx['num_sms'])
-    for full_weight in (full_gate_weight, full_up_weight, full_down_weight):
+    for source, slots in weight_pairs:
+        launch_prefetch(source, slots, experts_to_copy, num_sms=num_sms)
+    for source, slots in scale_pairs or ():
         launch_prefetch(
-            full_weight[:E],
-            full_weight[E:],
+            retile_for_prefetch(source),
+            retile_for_prefetch(slots),
             experts_to_copy,
             num_sms=num_sms,
         )
-    for full_scale in scales or ():
-        tiled = retile_for_prefetch(full_scale)
-        launch_prefetch(
-            tiled[:E],
-            tiled[E:],
-            experts_to_copy,
-            num_sms=num_sms,
+
+
+def _check_prefetch_pairs(pairs, B: int, kind: str):
+    for source, slots in pairs:
+        assert source.is_contiguous(), \
+            f"prefetch_weight: {kind} sources must be contiguous"
+        assert slots.is_contiguous(), \
+            f"prefetch_weight: {kind} slots must be contiguous"
+        assert slots.dtype == source.dtype, (
+            f"prefetch_weight: {kind} slot dtype {slots.dtype} does not match "
+            f"source dtype {source.dtype}"
         )
+        assert int(slots.shape[0]) == B, (
+            f"prefetch_weight: {kind} slots must hold B={B} rows, "
+            f"got {tuple(slots.shape)}"
+        )
+        assert tuple(slots.shape[1:]) == tuple(source.shape[1:]), (
+            f"prefetch_weight: {kind} slot shape {tuple(slots.shape)} does not "
+            f"match source {tuple(source.shape)} past dim 0"
+        )
+    return tuple(pairs)
+
+
+def _prefetch_pairs(sources, slots, E: int, B: int, kind: str):
+    """Pair each named source tensor with the slots the copy writes into.
+    """
+    if all(s is None for s in slots):
+        for source in sources:
+            assert int(source.shape[0]) == E + B, (
+                f"prefetch_weight: {kind} without explicit slots must be a "
+                f"[E+B, ...] block, got {tuple(source.shape)} for E={E}, B={B}"
+            )
+        return tuple((source[:E], source[E:]) for source in sources)
+
+    assert all(s is not None for s in slots), (
+        f"prefetch_weight: {kind} slots must be given for every projection"
+    )
+    return _check_prefetch_pairs(tuple(zip(sources, slots)), B, kind)
 
 
 def _launch_full_grad_reduces(
@@ -707,14 +741,14 @@ class Buffer:
         self,
         ctx: dict,
         experts_to_copy: torch.Tensor,
-        weight_prefetch_args,
-        scale_prefetch_args=None,
+        weight_pairs,
+        scale_pairs=None,
     ) -> None:
         _launch_full_weight_prefetches(
             ctx,
-            *weight_prefetch_args,
-            experts_to_copy[int(ctx['rank'])],
-            scales=scale_prefetch_args,
+            weight_pairs,
+            experts_to_copy,
+            scale_pairs=scale_pairs,
         )
 
     def dispatch(
@@ -868,6 +902,15 @@ class Buffer:
         full_gate_scale: torch.Tensor | None = None,
         full_up_scale: torch.Tensor | None = None,
         full_down_scale: torch.Tensor | None = None,
+        gate_slots: torch.Tensor | None = None,
+        up_slots: torch.Tensor | None = None,
+        down_slots: torch.Tensor | None = None,
+        gate_scale_slots: torch.Tensor | None = None,
+        up_scale_slots: torch.Tensor | None = None,
+        down_scale_slots: torch.Tensor | None = None,
+        weight_pairs: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        scale_pairs: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        experts_to_copy: torch.Tensor | None = None,
     ):
         """Prefetch the remote expert weights selected by ``plan`` into the
         local prefetch slots (dispatch fwd, weight side).
@@ -876,14 +919,31 @@ class Buffer:
             plan: MoonEPCommPlan returned by ``dispatch``.
             async_finish: run on the comm stream and return a CUDA event.
             full_gate_weight / full_up_weight / full_down_weight:
-                [E+B, H, H'] contiguous weight tensors; rows [0, E) are source
-                expert weights, rows [E, E+B) are the prefetch slots filled by
-                this call. bf16 for unquantized experts, uint8 for MXFP4 (e2m1
-                packs two values per byte, so H' is K/2).
+                contiguous weight tensors the plan's expert ids index into.
+                bf16 for unquantized experts, uint8 for MXFP4 (e2m1 packs two
+                values per byte, so H' is K/2). Without the ``*_slots``
+                arguments these must be ``[E+B, H, H']`` blocks whose trailing
+                B rows are the slots; with them, only the source rows.
             full_gate_scale / full_up_scale / full_down_scale:
-                optional [E+B, ...] contiguous block-scale tensors, same row
-                convention. Required for quantized experts and omitted for bf16
-                ones.
+                optional block-scale tensors, same convention. Required for
+                quantized experts and omitted for bf16 ones.
+            gate_slots / up_slots / down_slots and their ``*_scale_slots``:
+                optional ``[B, ...]`` destinations, given together per group.
+                Use these when the sources cannot carry their slots inline --
+                a symmetric VMM range pads each rank's chunk to allocation
+                granularity, so no ``E+B`` contiguous rows exist. They may be
+                separate allocations or non-overlapping views of the source.
+            weight_pairs / scale_pairs:
+                ``(source, slots)`` sequences of any length, replacing the
+                named arguments above. Inference frameworks rarely keep the
+                gate/up/down split: a fused ``w13`` plus ``w2`` and their two
+                block scales is four tensors, not two groups of three.
+            experts_to_copy:
+                optional ``[B]`` int32 override for ``plan.experts_to_copy``
+                on this rank. Entries index the *source* tensors, which is not
+                the global expert id once the sources are a VMM range with
+                alignment padding between rank chunks -- the caller owning
+                that layout is the one that can remap them.
 
         Returns:
             None in synchronous mode, or the comm-stream CUDA event when
@@ -895,33 +955,68 @@ class Buffer:
         returned event also covers the queued dispatch.
         """
         ctx = self._require_ctx()
+        E, B = int(ctx['E']), int(ctx['B'])
 
         assert isinstance(plan, MoonEPCommPlan), "Buffer.prefetch_weight: plan is required"
-        weight_prefetch_args = (full_gate_weight, full_up_weight, full_down_weight)
-        assert all(w is not None for w in weight_prefetch_args), \
-            "prefetch_weight tensors must be provided together"
-        for w in weight_prefetch_args:
-            assert w.dtype in _ELEM_TYPES, \
-                f"prefetch_weight: unsupported weight dtype {w.dtype}"
-            assert w.is_contiguous()
-            assert w.ndim == 3 and int(w.shape[0]) == int(ctx['E']) + int(ctx['B'])
-
-        scale_prefetch_args = (full_gate_scale, full_up_scale, full_down_scale)
-        if any(s is not None for s in scale_prefetch_args):
-            assert all(s is not None for s in scale_prefetch_args), \
-                "prefetch_weight scales must be provided together"
-            for s in scale_prefetch_args:
-                assert s.is_contiguous()
-                assert s.ndim >= 2 and int(s.shape[0]) == int(ctx['E']) + int(ctx['B'])
+        named_args = (
+            full_gate_weight, full_up_weight, full_down_weight,
+            full_gate_scale, full_up_scale, full_down_scale,
+            gate_slots, up_slots, down_slots,
+            gate_scale_slots, up_scale_slots, down_scale_slots,
+        )
+        if weight_pairs is not None:
+            assert all(a is None for a in named_args), \
+                "prefetch_weight: weight_pairs replaces the gate/up/down arguments"
+            for source, _ in weight_pairs:
+                assert source.dtype in _ELEM_TYPES, \
+                    f"prefetch_weight: unsupported weight dtype {source.dtype}"
+            weight_pairs = _check_prefetch_pairs(weight_pairs, B, "weight")
+            if scale_pairs is not None:
+                scale_pairs = _check_prefetch_pairs(scale_pairs, B, "scale")
         else:
-            scale_prefetch_args = None
+            assert scale_pairs is None, \
+                "prefetch_weight: scale_pairs requires weight_pairs"
+            weight_sources = (full_gate_weight, full_up_weight, full_down_weight)
+            assert all(w is not None for w in weight_sources), \
+                "prefetch_weight tensors must be provided together"
+            for w in weight_sources:
+                assert w.dtype in _ELEM_TYPES, \
+                    f"prefetch_weight: unsupported weight dtype {w.dtype}"
+                assert w.is_contiguous()
+                assert w.ndim == 3
+            weight_pairs = _prefetch_pairs(
+                weight_sources, (gate_slots, up_slots, down_slots), E, B, "weight"
+            )
+
+            scale_sources = (full_gate_scale, full_up_scale, full_down_scale)
+            scale_slot_args = (gate_scale_slots, up_scale_slots, down_scale_slots)
+            if any(s is not None for s in scale_sources):
+                assert all(s is not None for s in scale_sources), \
+                    "prefetch_weight scales must be provided together"
+                for s in scale_sources:
+                    assert s.is_contiguous()
+                    assert s.ndim >= 2
+                scale_pairs = _prefetch_pairs(
+                    scale_sources, scale_slot_args, E, B, "scale"
+                )
+            else:
+                assert all(s is None for s in scale_slot_args), \
+                    "prefetch_weight: scale slots given without scale sources"
+                scale_pairs = None
+
+        if experts_to_copy is None:
+            experts_to_copy = plan.experts_to_copy[int(ctx['rank'])]
+        assert experts_to_copy.ndim == 1 and int(experts_to_copy.shape[0]) == B, (
+            f"prefetch_weight: experts_to_copy must be [B={B}], "
+            f"got {tuple(experts_to_copy.shape)}"
+        )
 
         if not async_finish:
             self._run_prefetch_weight_on_current_stream(
                 ctx,
-                plan.experts_to_copy,
-                weight_prefetch_args,
-                scale_prefetch_args,
+                experts_to_copy,
+                weight_pairs,
+                scale_pairs,
             )
             return None
 
@@ -930,7 +1025,11 @@ class Buffer:
         assert comm is not None, "MoonEP Buffer communication stream is not initialized"
 
         self._record_streams(
-            (plan.experts_to_copy, *weight_prefetch_args, *(scale_prefetch_args or ())),
+            (
+                experts_to_copy,
+                *(t for pair in weight_pairs for t in pair),
+                *(t for pair in scale_pairs or () for t in pair),
+            ),
             comm,
         )
         input_ready = main_stream.record_event()
@@ -939,9 +1038,9 @@ class Buffer:
         with torch.cuda.stream(comm):
             self._run_prefetch_weight_on_current_stream(
                 ctx,
-                plan.experts_to_copy,
-                weight_prefetch_args,
-                scale_prefetch_args,
+                experts_to_copy,
+                weight_pairs,
+                scale_pairs,
             )
             done = comm.record_event()
 
