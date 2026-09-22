@@ -91,7 +91,7 @@ class MoonEPCommPlan:
 # ============================================================
 BLOCK_SIZE_P2 = 2048
 BLOCK_DIM_P2 = 512
-ITEMS_PER_THREAD_P2 = BLOCK_SIZE_P2 // BLOCK_DIM_P2  # 4
+BLOCK_DIM_P2_MIN = 32
 
 
 def ceil_div(x, y):
@@ -328,7 +328,7 @@ def _pd_issue_g2s(meta, smem_stage, src_begin, logical_count, mbar):
 class PlanningKernel:
     def __init__(self, R, E, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                  TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
-                 token_padding, num_sms):
+                 token_padding, num_sms, block_dim):
         self.R, self.E, self.S, self.K = R, E, S, K
         self.N = self.S * self.K
         self.NvS_capacity, self.NvS, self.num_vblocks = NvS_capacity, NvS, num_vblocks
@@ -336,6 +336,7 @@ class PlanningKernel:
         self.TPE_OFF, self.PLAN_OFF, self.BARRIER_OFF = TPE_OFF, PLAN_OFF, BARRIER_OFF
         self.TOPK0_OFF, self.ORDER_OFF, self.ORDER0_OFF = TOPK0_OFF, ORDER_OFF, ORDER0_OFF
         self.token_padding, self.num_sms = token_padding, num_sms
+        self.block_dim = block_dim
 
     @cute.jit
     def __call__(self, tpe, topk, meta, mc, dst, cu_seqlens,
@@ -365,7 +366,7 @@ class PlanningKernel:
         self.kernel(tpe_t, topk_t, meta_t, mc_t, dst_t, cu_t, etc_t,
                     zfr_t, stats_t, alloc_t, gt_t, z_t, lh_t, bar_t,
                     rank).launch(
-            grid=(num_sms, 1, 1), block=(BLOCK_DIM_P2, 1, 1),
+            grid=(num_sms, 1, 1), block=(self.block_dim, 1, 1),
             stream=stream, cooperative=True)
 
     # =========================================================
@@ -374,14 +375,14 @@ class PlanningKernel:
     @cute.jit
     def run_c1(self, topk_src, order_dst, tpe_src, local_hist, s_hist, s_bp, s_wcount,
                bar_ptr, num_sms, pid, tid):
-        R = cutlass.const_expr(self.R)
         E = cutlass.const_expr(self.E)
-        NUM_WARPS = cutlass.const_expr(BLOCK_DIM_P2 // 32)
+        T = cutlass.const_expr(self.block_dim)
+        NUM_WARPS = cutlass.const_expr(T // 32)
         WST = cutlass.const_expr(NUM_WARPS + 1)
-        IPT = cutlass.const_expr(ITEMS_PER_THREAD_P2)
+        IPT = cutlass.const_expr(ceil_div(BLOCK_SIZE_P2, self.block_dim))
         N = cutlass.const_expr(self.N)
         num_vblocks = cutlass.const_expr(self.num_vblocks)
-        num_threads = BLOCK_DIM_P2
+        num_threads = T
         warp = tid >> 5
         lane = tid & 31
 
@@ -447,7 +448,10 @@ class PlanningKernel:
                 off = chunk + p
                 my_p.append(p)
                 ev = E
-                if off < N:
+                if cutlass.const_expr(BLOCK_SIZE_P2 % self.block_dim == 0):
+                    if off < N:
+                        ev = topk_in[off]
+                elif (p < BLOCK_SIZE_P2) & (off < N):
                     ev = topk_in[off]
                 my_e.append(ev)
 
@@ -503,7 +507,9 @@ class PlanningKernel:
         epn = cutlass.const_expr(E // R)
         LOG2_R = cutlass.const_expr(log2_r(R))
         EB_PAD = cutlass.const_expr(ceil_pow2(2 * epn))
-        IPT_EB = cutlass.const_expr(ceil_div(EB_PAD, BLOCK_DIM_P2))
+        T = cutlass.const_expr(self.block_dim)
+        IPT = cutlass.const_expr(ceil_div(BLOCK_SIZE_P2, self.block_dim))
+        IPT_EB = cutlass.const_expr(ceil_div(EB_PAD, T))
         ms = cutlass.const_expr(self.meta_stride)
         N = cutlass.const_expr(self.N)
         NvS = cutlass.const_expr(self.NvS)
@@ -526,12 +532,12 @@ class PlanningKernel:
         ETC_SUB = ZFR_SUB + 2 * R * (2 * epn)
         STATS_SUB = ETC_SUB + R * epn
         PB = PLAN_OFF
-        num_threads = BLOCK_DIM_P2
-        NUM_WARPS = cutlass.const_expr(BLOCK_DIM_P2 // 32)
+        num_threads = T
+        NUM_WARPS = cutlass.const_expr(T // 32)
         S1_TILE = 32
         S1_COLS = cutlass.const_expr(min(
             align_up((E + num_sms - 1) // num_sms, S1_TILE),
-            BLOCK_DIM_P2,
+            T,
         ))
         pid = cute.arch.block_idx()[0]
         tid = cute.arch.thread_idx()[0]
@@ -561,7 +567,7 @@ class PlanningKernel:
         scratch_ints = cutlass.const_expr(max(
             R * S1_COLS,
             E + E // R + R,
-            (E + 1) * (BLOCK_DIM_P2 // 32 + 1),
+            (E + 1) * (T // 32 + 1),
             PD_SCRATCH_INTS,
         ))
         scratch = sa(scratch_ints)
@@ -1015,9 +1021,9 @@ class PlanningKernel:
         cute.arch.barrier()
         seg = cute.ceil_div(N, num_sms)
         sbeg = pid * seg; send = cutlass.min(sbeg + seg, N)
-        for base in cutlass.range(sbeg + tid, send, num_threads * ITEMS_PER_THREAD_P2):
-            for i in cutlass.range_constexpr(ITEMS_PER_THREAD_P2):
-                idx = base + i * BLOCK_DIM_P2
+        for base in cutlass.range(sbeg + tid, send, num_threads * IPT):
+            for i in cutlass.range_constexpr(IPT):
+                idx = base + i * T
                 if idx < send:
                     offv = order_in[idx]
                     expert_idx = topk_by_off[offv]
@@ -1103,13 +1109,47 @@ class PlanningKernel:
 # ============================================================
 # Host side: compile cache + launch
 # ============================================================
+def _planning_smem_bytes(E, R, num_sms, block_dim):
+    epn = E // R
+    s1_cols = min(align_up(ceil_div(E, num_sms), 32), block_dim)
+    phase_d_groups = align_up(ceil_div(2 * epn, num_sms), 32)
+    phase_d_etc = align_up(ceil_div(R * epn, num_sms), 32)
+    pd_cu_len = align_up(phase_d_groups + 4, 4)
+    pd_zfr_len = align_up(2 * phase_d_groups + 4, 4)
+    pd_etc_len = align_up(phase_d_etc + 4, 4)
+    scratch_ints = max(
+        R * s1_cols,
+        E + epn + R,
+        (E + 1) * (block_dim // 32 + 1),
+        pd_cu_len + pd_zfr_len + pd_etc_len,
+    )
+    # scratch, s_hist, s_bp, s_col, s_chosen, s_wmax, plus mbarrier.
+    arrays = (scratch_ints, E, E, E, epn, 64)
+    return sum(align_up(n, 16) * 4 for n in arrays) + 16
+
+
+def _select_planning_block_dim(E, R, num_sms, device):
+    """Return the largest 32-thread-aligned CTA that fits device SMEM."""
+    props = torch.cuda.get_device_properties(device)
+    limit = int(
+        getattr(props, "shared_memory_per_block_optin", 0)
+        or props.shared_memory_per_block
+    )
+    for block_dim in range(BLOCK_DIM_P2, BLOCK_DIM_P2_MIN - 1, -32):
+        if _planning_smem_bytes(E, R, num_sms, block_dim) <= limit:
+            return block_dim
+    # Keep the hard floor explicit. If even one warp exceeds the device
+    # limit, let the generated kernel report the real resource failure.
+    return BLOCK_DIM_P2_MIN
+
+
 @functools.lru_cache(maxsize=None)
 def _get_compiled(R, E, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                   TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
-                  token_padding, num_sms):
+                  token_padding, num_sms, block_dim):
     k = PlanningKernel(R, E, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                        TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
-                       token_padding, num_sms)
+                       token_padding, num_sms, block_dim)
     i32 = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=16)
     return cute.compile(k, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32,
                         i32, i32, i32, i32, Int32(0), cuda.CUstream(0))
@@ -1117,6 +1157,9 @@ def _get_compiled(R, E, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
 
 def _launch_planning_kernel(ctx, topk, tpe, dst, cu_seqlens,
                             experts_to_copy, zero_fill_ranges, remote_stats):
+    block_dim = _select_planning_block_dim(
+        int(ctx['E']), int(ctx['R']), int(ctx['num_sms']), topk.device
+    )
     comp = _get_compiled(
         int(ctx['R']),
         int(ctx['E']),
@@ -1134,6 +1177,7 @@ def _launch_planning_kernel(ctx, topk, tpe, dst, cu_seqlens,
         int(ctx['ORDER0_OFF']),
         int(ctx['token_padding']),
         int(ctx['num_sms']),
+        block_dim,
     )
 
     def p16(t):  # large buffers 16B aligned -> allows coalesced/vectorized access
