@@ -64,10 +64,10 @@ from .buffer import (
     get_vmm_granularity,
     get_multicast_granularity,
 )
-from .constants import DEDUP_BUILDER_WARPS
+from .constants import DEDUP_BUILDER_WARPS, FP8_TILE_SIZE
 from .planning import MoonEPCommPlan, allocate_planning_outputs, launch_planning
 from .inter_rank_sync import launch_inter_rank_sync
-from .dispatch import launch_dispatch
+from .dispatch import check_dispatch_input, launch_dispatch
 from .dispatch_epilogue import launch_dispatch_epilogue
 from .combine import launch_combine
 from .combine_prologue import launch_combine_prologue
@@ -410,6 +410,17 @@ def _create_context(
         'weights_buf_local': meta_buf[rank * meta_chunk_padded + WEIGHTS_OFF:
                                       rank * meta_chunk_padded + WEIGHTS_OFF + NvS],
     }
+    if H % FP8_TILE_SIZE == 0:
+        # Reuse each bf16 shard for fp8 dispatch. Its first half holds packed
+        # fp8 rows; the second starts with contiguous fp32 scale rows. Both
+        # fit in the existing allocation (132 bytes per tile vs 256 in bf16).
+        # Keep the physical rank stride unchanged so bf16 combine can reuse it.
+        shard = hidden_buf[rank * NvS_padded:(rank + 1) * NvS_padded]
+        ctx['hidden_fp8_buf_local'] = shard.view(torch.float8_e4m3fn).view(-1, H)[:NvS]
+        scale_offset = NvS_padded * H // 4
+        ctx['scales_buf_local'] = shard.view(torch.float32).view(-1)[
+            scale_offset:scale_offset + NvS * (H // FP8_TILE_SIZE)
+        ].view(NvS, H // FP8_TILE_SIZE)
     _log_context_buffer_size(ctx)
     return ctx
 
@@ -531,6 +542,8 @@ class Buffer:
         # Drop views before owners. Tensor deleters release VMM mappings and
         # multicast handles once the Python references disappear.
         for key in (
+            'hidden_fp8_buf_local',
+            'scales_buf_local',
             'hidden_buf_local',
             'weights_buf_local',
             'meta_mc',
@@ -572,7 +585,9 @@ class Buffer:
     @staticmethod
     def _record_streams(tensors, stream: torch.cuda.Stream) -> None:
         for t in tensors:
-            if t is not None:
+            if isinstance(t, tuple):
+                Buffer._record_streams(t, stream)
+            elif t is not None:
                 t.record_stream(stream)
 
     @staticmethod
@@ -590,11 +605,11 @@ class Buffer:
     def _run_dispatch_on_current_stream(
         self,
         ctx: dict,
-        hidden_sh: torch.Tensor,
+        hidden_sh: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         route_weights_sk: torch.Tensor | None,
         planning_args,
         plan: MoonEPCommPlan,
-        hidden_nvsh: torch.Tensor,
+        hidden_nvsh: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         route_weights_nvs: torch.Tensor | None,
         *,
         inter_rank_sync: bool,
@@ -623,11 +638,18 @@ class Buffer:
         )
         # In-place duplicate expansion on the NVL shard: after this the shard
         # holds the full user-visible [NvS, H] layout.
-        launch_dispatch_epilogue(ctx, plan, pdl_launch=self.enable_pdl)
+        use_fp8 = isinstance(hidden_sh, tuple)
+        launch_dispatch_epilogue(
+            ctx, plan, pdl_launch=self.enable_pdl, use_fp8=use_fp8,
+        )
         # master-style boundary copies (same stream, plain SM copies), gated
         # independently per output tensor.
         if not zero_copy:
-            hidden_nvsh.copy_(ctx['hidden_buf_local'])
+            if use_fp8:
+                hidden_nvsh[0].copy_(ctx['hidden_fp8_buf_local'])
+                hidden_nvsh[1].copy_(ctx['scales_buf_local'])
+            else:
+                hidden_nvsh.copy_(ctx['hidden_buf_local'])
         if route_weights_nvs is not None and not route_weights_zero_copy:
             route_weights_nvs.copy_(
                 ctx['weights_buf_local'].view(torch.float32)
@@ -697,7 +719,7 @@ class Buffer:
 
     def dispatch(
         self,
-        hidden_sh: torch.Tensor,
+        hidden_sh: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         route_weights_sk: torch.Tensor | None = None,
         topk_experts_sk: torch.Tensor | None = None,
         tokens_per_expert: torch.Tensor | None = None,
@@ -712,7 +734,12 @@ class Buffer:
         to their expert-grouped positions on remote ranks.
 
         Args:
-            hidden_sh: [S, H] bf16 input tokens.
+            hidden_sh: [S, H] bf16 input tokens, or a tuple of contiguous
+                [S, H] torch.float8_e4m3fn data and [S, H // 128] fp32
+                dequantization scales. FP8 requires H divisible by 128;
+                each 1x128 tile reconstructs as data.float() * scale.
+                Row-major and column-major input scales are supported.
+                Quantization is performed by the caller, before dispatch.
             route_weights_sk: [S, K] fp32 routing weights; None skips the
                 weights buffer entirely.
             topk_experts_sk: [S, K] int32 expert ids; required when ``plan``
@@ -749,7 +776,10 @@ class Buffer:
             comm-stream CUDA event when ``async_finish=True``:
 
             - hidden_nvsh: [NvS, H] bf16 dispatched tokens in physical VM
-              group order.
+              group order, or (FP8 data [NvS, H], fp32 scales [NvS, H // 128])
+              for FP8 input. Both outputs are contiguous. With zero_copy=True
+              both alias the communication buffer, including the bf16
+              hidden_nvsh_buffer_view used for expert outputs and combine.
             - route_weights_nvs: [NvS] fp32, or None when ``route_weights_sk``
               is None.
             - cu_seqlens: [2*epn] int32 padded token end offset per VM group
@@ -758,6 +788,7 @@ class Buffer:
               backward passes.
         """
         ctx = self._require_ctx()
+        _, hidden_scales = check_dispatch_input(ctx, hidden_sh)
 
         if plan is None:
             assert topk_experts_sk is not None and tokens_per_expert is not None
@@ -772,7 +803,10 @@ class Buffer:
             planning_args = None
             assert isinstance(plan, MoonEPCommPlan)
 
-        if zero_copy:
+        if hidden_scales is not None:
+            views = (ctx['hidden_fp8_buf_local'], ctx['scales_buf_local'])
+            hidden_nvsh = views if zero_copy else tuple(torch.empty_like(t) for t in views)
+        elif zero_copy:
             hidden_nvsh = ctx['hidden_buf_local']
         else:
             hidden_nvsh = torch.empty_like(ctx['hidden_buf_local'])
@@ -995,8 +1029,8 @@ class Buffer:
             async_finish: run on the comm stream and return a CUDA event.
             inter_rank_sync: run a CuTe DSL rank sync before staging
                 (default True).
-            zero_copy: ``hidden_nvsh`` must be exactly the view returned by a
-                ``zero_copy=True`` dispatch — the caller's FFN writes its
+            zero_copy: ``hidden_nvsh`` must be the bf16
+                ``hidden_nvsh_buffer_view`` — the caller's FFN writes its
                 output in place on the shard and no boundary copy is performed
                 (asserted via ``data_ptr()``). With ``zero_copy=False`` the
                 input is an ordinary tensor that is first copied into the
@@ -1029,8 +1063,8 @@ class Buffer:
             assert tuple(route_weights_nvs.shape) == (int(ctx['NvS']),)
         if zero_copy:
             assert hidden_nvsh.data_ptr() == ctx['hidden_buf_local'].data_ptr(), (
-                "combine(zero_copy=True): hidden_nvsh must alias the NVL shard "
-                "view returned by dispatch(zero_copy=True)"
+                "combine(zero_copy=True): hidden_nvsh must alias the bf16 "
+                "hidden_nvsh_buffer_view"
             )
         if router_weights_zero_copy and route_weights_nvs is not None:
             assert route_weights_nvs.data_ptr() == \

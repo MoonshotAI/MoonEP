@@ -26,7 +26,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
-from cutlass import BFloat16, Int32, Int64
+from cutlass import BFloat16, Int32, Int64, Uint8
 from cutlass.cute.runtime import make_ptr
 
 from moonep._common import (
@@ -35,6 +35,7 @@ from moonep._common import (
     pdl_wait_predecessor,
 )
 from moonep.planning import MoonEPCommPlan
+from moonep.constants import FP8_TILE_SIZE
 
 
 # ============================================================================
@@ -77,54 +78,73 @@ class DispatchEpilogueKernel:
         num_sms: int,
         smem_budget: int,
         pdl_launch: bool,
+        use_fp8: bool = False,
     ):
         self.H = H
+        self.use_fp8 = use_fp8
+        self.elem_type = Uint8 if use_fp8 else BFloat16
+        self.elem_bytes = 1 if use_fp8 else 2
         self.NvS = NvS
         self.num_sms = num_sms
         self.pdl_launch = pdl_launch
-        self.B, self.stages = self._pick_geometry(H, smem_budget)
+        # FP8 scale rows that are 16-B multiples are staged by TMA with their
+        # payload rows, so the consumer reads primary scales from smem.
+        self.scale_bulk = use_fp8 and (H // FP8_TILE_SIZE * 4) % 16 == 0
+        self.scale_row_bytes = H // FP8_TILE_SIZE * 4 if self.scale_bulk else 0
+        self.B, self.stages = self._pick_geometry(
+            H, smem_budget, self.elem_bytes, self.scale_row_bytes,
+        )
         # Consumer reads the B batch headers with one lane each + shuffle.
         assert self.B <= 32, "batch size B must fit in one warp"
         if self.stages == 0:
             raise RuntimeError(
                 f"dispatch epilogue: H={H} too large for per-block smem budget "
-                f"{smem_budget} B (need at least {self._smem_bytes(H, 2, 1)} B)"
+                f"{smem_budget} B (need at least {self._smem_bytes(H, 2, 1, self.elem_bytes, self.scale_row_bytes)} B)"
             )
 
     @staticmethod
-    def _smem_bytes(H: int, stages: int, B: int) -> int:
-        # stage_smem (bf16, B rows x kStages deep) + 2 mbar i64 per stage
-        # (full+empty), padded like the dispatch kernel, plus 256 B cutlass
-        # headroom.
+    def _smem_bytes(
+        H: int, stages: int, B: int, elem_bytes: int = 2, scale_row_bytes: int = 0,
+    ) -> int:
+        # stage_smem (payload, B rows x kStages deep) + optional scale rows +
+        # 2 mbar i64 per stage (full+empty), padded like the dispatch kernel,
+        # plus 256 B cutlass headroom.
         def _round_up(n: int, a: int) -> int:
             return (n + a - 1) // a * a
         return (
-            _round_up(stages * B * H * 2, 128)
+            _round_up(stages * B * H * elem_bytes, 128)
+            + _round_up(stages * B * scale_row_bytes, 16)
             + _round_up(stages * 2 * 8, 16)
             + 256
         )
 
     @classmethod
-    def _pick_stages(cls, H: int, smem_budget: int, B: int) -> int:
+    def _pick_stages(
+        cls, H: int, smem_budget: int, B: int, elem_bytes: int = 2,
+        scale_row_bytes: int = 0,
+    ) -> int:
         for s in (16, 14, 12, 10, 8, 6, 4, 2):
-            if cls._smem_bytes(H, s, B) <= smem_budget:
+            if cls._smem_bytes(H, s, B, elem_bytes, scale_row_bytes) <= smem_budget:
                 return s
         return 0
 
     @classmethod
-    def _pick_geometry(cls, H: int, smem_budget: int) -> tuple[int, int]:
+    def _pick_geometry(
+        cls, H: int, smem_budget: int, elem_bytes: int = 2, scale_row_bytes: int = 0,
+    ) -> tuple[int, int]:
         for b in cls._B_CANDIDATES:
-            s = cls._pick_stages(H, smem_budget, b)
+            s = cls._pick_stages(H, smem_budget, b, elem_bytes, scale_row_bytes)
             if s >= cls._MIN_STAGES:
                 return b, s
-        return 1, cls._pick_stages(H, smem_budget, 1)
+        return 1, cls._pick_stages(H, smem_budget, 1, elem_bytes, scale_row_bytes)
 
     # ------------------------------------------------------------------ host
 
     @cute.jit
     def __call__(
         self,
-        hidden_buf_local_ptr: cute.Pointer,  # bf16 [NvS, H] local NVL shard
+        hidden_buf_local_ptr: cute.Pointer,  # bf16 or fp8 [NvS, H] local NVL shard
+        scales_buf_local_ptr: cute.Pointer,  # int32 bits of fp32 [NvS, H/128]
         dup_groups_ptr: cute.Pointer,        # int32 [NvS, 3]
         dup_loffs_ptr: cute.Pointer,         # int32 [NvS,]
         dup_counts_ptr: cute.Pointer,        # int32 [2,]
@@ -137,6 +157,11 @@ class DispatchEpilogueKernel:
             hidden_buf_local_ptr,
             cute.make_layout((NvS, H), stride=(Int64(H), Int64(1))),
         )
+        num_scales = max(H // FP8_TILE_SIZE, 1)
+        scales = cute.make_tensor(
+            scales_buf_local_ptr,
+            cute.make_layout((NvS, num_scales), stride=(Int64(num_scales), Int64(1))),
+        )
         dup_groups_tensor = cute.make_tensor(
             dup_groups_ptr, cute.make_layout((NvS * 3,))
         )
@@ -147,10 +172,13 @@ class DispatchEpilogueKernel:
             dup_counts_ptr, cute.make_layout((2,))
         )
 
-        smem_bytes = self._smem_bytes(H, self.stages, self.B)
+        smem_bytes = self._smem_bytes(
+            H, self.stages, self.B, self.elem_bytes, self.scale_row_bytes,
+        )
 
         self.kernel(
             hidden,
+            scales,
             dup_groups_tensor,
             dup_loffs_tensor,
             dup_counts_tensor,
@@ -168,12 +196,15 @@ class DispatchEpilogueKernel:
     def kernel(
         self,
         hidden: cute.Tensor,
+        scales: cute.Tensor,
         dup_groups_tensor: cute.Tensor,
         dup_loffs_tensor: cute.Tensor,
         dup_counts_tensor: cute.Tensor,
     ):
         H = cutlass.const_expr(self.H)
-        H_BYTES = cutlass.const_expr(H * 2)
+        H_BYTES = cutlass.const_expr(H * self.elem_bytes)
+        SCALE_BYTES = cutlass.const_expr(self.scale_row_bytes)
+        NUM_SCALES = cutlass.const_expr(H // FP8_TILE_SIZE)
         stages = cutlass.const_expr(self.stages)
         num_sms = cutlass.const_expr(self.num_sms)
         B = cutlass.const_expr(self.B)
@@ -188,10 +219,16 @@ class DispatchEpilogueKernel:
         smem = utils.SmemAllocator()
         load_mbar = smem.allocate_array(Int64, num_elems=2 * stages)
         stage_smem = smem.allocate_tensor(
-            BFloat16,
+            self.elem_type,
             cute.make_ordered_layout((B, H, stages), order=(1, 0, 2)),
             byte_alignment=128,
         )
+        if cutlass.const_expr(self.scale_bulk):
+            scale_smem = smem.allocate_tensor(
+                Int32,
+                cute.make_ordered_layout((NUM_SCALES, B, stages), order=(0, 1, 2)),
+                byte_alignment=16,
+            )
 
         # Load pipeline (TMA G2S):
         #   Producer = warp 0 (1 effective thread, lane 0).
@@ -226,7 +263,9 @@ class DispatchEpilogueKernel:
                 # cp.async.bulk is single-thread; only lane 0 issues it.
                 if lane == 0:
                     mbar = load_pipe.producer_get_barrier(load_state)
-                    cute.arch.mbarrier_arrive_and_expect_tx(mbar, n * H_BYTES)
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        mbar, n * (H_BYTES + SCALE_BYTES),
+                    )
 
                     for idx in cutlass.range(n, unroll=1):
                         loff = dup_groups_tensor[(gi + idx) * 3]
@@ -242,6 +281,20 @@ class DispatchEpilogueKernel:
                             Int32(H_BYTES).ir_value(),
                             mbar.toint().ir_value(),
                         )
+                        if cutlass.const_expr(self.scale_bulk):
+                            g_scale_int = (
+                                scales.iterator + Int64(loff) * Int64(NUM_SCALES)
+                            ).toint()
+                            s_scale_int = (
+                                scale_smem.iterator
+                                + (load_state.index * B + idx) * NUM_SCALES
+                            ).toint()
+                            cp_async_bulk_g2s(
+                                s_scale_int.ir_value(),
+                                g_scale_int.ir_value(),
+                                Int32(SCALE_BYTES).ir_value(),
+                                mbar.toint().ir_value(),
+                            )
                 load_state.advance()
                 gi += Int32(num_sms * B)
 
@@ -288,6 +341,19 @@ class DispatchEpilogueKernel:
                                 g_dup_int.ir_value(),
                                 Int32(H_BYTES).ir_value(),
                             )
+                    if cutlass.const_expr(self.use_fp8):
+                        if cutlass.const_expr(not self.scale_bulk):
+                            primary = dup_groups_tensor[(gi + idx) * 3]
+                        for tile in cutlass.range_constexpr((NUM_SCALES + 31) // 32):
+                            col = tile * 32 + lane
+                            if col < NUM_SCALES:
+                                if cutlass.const_expr(self.scale_bulk):
+                                    scale = scale_smem[col, idx, use_state.index]
+                                else:
+                                    scale = scales[primary, col]
+                                for k in cutlass.range(cur_dup_n, unroll=1):
+                                    slot = dup_loffs_tensor[cur_dup_start + k]
+                                    scales[slot, col] = scale
                 if lane == 0:
                     cute.arch.cp_async_bulk_commit_group()
                 use_state.advance()
@@ -342,20 +408,22 @@ def _get_compiled(
     num_sms: int,
     device_index: int,
     pdl_launch: bool,
+    use_fp8: bool = False,
 ):
     smem_budget = _max_smem_per_block_optin(device_index) - 1024
     kernel = DispatchEpilogueKernel(
         H=H, NvS=NvS, num_sms=num_sms, smem_budget=smem_budget,
-        pdl_launch=pdl_launch,
+        pdl_launch=pdl_launch, use_fp8=use_fp8,
     )
 
-    bf16_ptr = make_ptr(BFloat16, 0, cute.AddressSpace.gmem, assumed_align=16)
+    payload_ptr = make_ptr(Uint8 if use_fp8 else BFloat16, 0, cute.AddressSpace.gmem, assumed_align=16)
     i32_ptr = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=16)
     stream_arg = cuda.CUstream(0)
 
     return cute.compile(
         kernel,
-        bf16_ptr,  # hidden_buf_local
+        payload_ptr,  # hidden_buf_local
+        i32_ptr,      # scales_buf_local
         i32_ptr,   # dup_groups
         i32_ptr,   # dup_loffs
         i32_ptr,   # dup_counts
@@ -368,6 +436,7 @@ def launch_dispatch_epilogue(
     plan: MoonEPCommPlan,
     *,
     pdl_launch: bool = False,
+    use_fp8: bool = False,
 ):
     """Expand duplicate rows in place on the local NVL shard.
 
@@ -375,28 +444,35 @@ def launch_dispatch_epilogue(
     cross_rank_barrier publishes the remote NVL writes this kernel reads.
     Consumes the plan-owned ``dup_groups`` / ``dup_loffs`` / ``dup_counts``
     written by a fresh dispatch builder (reuse paths pass the saved tensors
-    unchanged). Purely local — no cross-rank communication.
+    unchanged). Purely local — no cross-rank communication. Set use_fp8=True
+    after an FP8 dispatch to expand both data and its fp32 scale rows.
     """
     H = int(ctx['H'])
     NvS = int(ctx['NvS'])
     num_sms = int(ctx['num_sms_dedup'])
-    dev = ctx['hidden_buf_local'].device
+    hidden = ctx['hidden_fp8_buf_local'] if use_fp8 else ctx['hidden_buf_local']
+    scales = ctx['scales_buf_local'] if use_fp8 else plan.dst
+    dev = hidden.device
     device_index = dev.index
 
     assert ctx['H'] % 8 == 0, "H must be multiple of 8 for 16-B bulk-copy alignment"
-    assert ctx['hidden_buf_local'].dtype == torch.bfloat16 and \
-        ctx['hidden_buf_local'].is_contiguous()
-    assert ctx['hidden_buf_local'].is_cuda, "hidden_buf_local must be a CUDA tensor"
-    assert tuple(ctx['hidden_buf_local'].shape) == (NvS, H), \
-        f"hidden_buf_local must be shape ({NvS}, {H}), " \
-        f"got {tuple(ctx['hidden_buf_local'].shape)}"
+    assert hidden.dtype == (torch.float8_e4m3fn if use_fp8 else torch.bfloat16)
+    assert hidden.is_contiguous() and hidden.is_cuda
+    assert tuple(hidden.shape) == (NvS, H)
+    if use_fp8:
+        assert H % FP8_TILE_SIZE == 0
+        assert scales.dtype == torch.float32 and scales.is_contiguous()
+        assert tuple(scales.shape) == (NvS, H // FP8_TILE_SIZE)
+        assert scales.device == dev
     assert device_index is not None, "dispatch epilogue requires a CUDA device"
     _check_epilogue_plan(ctx, plan, dev)
 
-    epilogue_compiled = _get_compiled(H, NvS, num_sms, device_index, bool(pdl_launch))
+    epilogue_compiled = _get_compiled(H, NvS, num_sms, device_index, bool(pdl_launch), use_fp8)
 
-    hbf_local_ptr = make_ptr(BFloat16, ctx['hidden_buf_local'].data_ptr(),
+    hbf_local_ptr = make_ptr(Uint8 if use_fp8 else BFloat16, hidden.data_ptr(),
                              cute.AddressSpace.gmem, assumed_align=16)
+    scales_local_ptr = make_ptr(Int32, scales.data_ptr(),
+                                cute.AddressSpace.gmem, assumed_align=16)
     dup_groups_ptr = make_ptr(Int32, plan.dup_groups.data_ptr(),
                               cute.AddressSpace.gmem, assumed_align=16)
     dup_loffs_ptr = make_ptr(Int32, plan.dup_loffs.data_ptr(),
@@ -408,6 +484,7 @@ def launch_dispatch_epilogue(
 
     epilogue_compiled(
         hbf_local_ptr,
+        scales_local_ptr,
         dup_groups_ptr,
         dup_loffs_ptr,
         dup_counts_ptr,
