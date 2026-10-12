@@ -107,6 +107,85 @@ buffer.prefetch_weight(
 # *_prefetch_buffer slice as [2*epn, H, H'].
 ```
 
+#### FP8 activation dispatch
+
+Like [DeepEP](https://github.com/deepseek-ai/DeepEP), `dispatch` accepts a
+`(data, scales)` tuple for DeepSeek tile-wise FP8 activations:
+
+- `data`: contiguous `[S, H]` `torch.float8_e4m3fn` (E4M3).
+- `scales`: `[S, H // 128]` `torch.float32`, one **dequantization** scale per
+  **1 × 128** activation tile; `H` must be divisible by 128. Row-major and
+  column-major input scales are accepted. Contiguous, 16-byte aligned scales
+  with `H` divisible by 512 (e.g. 3584, 7168) are the fast path: scale rows
+  are loaded by TMA together with their payload rows. Other layouts fall back
+  to per-element scale loads.
+- Reconstruction: `data.float().view(S, H // 128, 128) * scales.unsqueeze(-1)`.
+
+```python
+# Quantize before communication; this is a PyTorch reference implementation.
+# A training/inference framework can supply its own fused quantizer instead.
+tiles = hidden_sh.float().view(S, H // 128, 128)
+amax = tiles.abs().amax(dim=-1).clamp_min(1e-4)
+scales = (amax / 448.0).contiguous()
+data = (tiles * (448.0 / amax).unsqueeze(-1)).to(torch.float8_e4m3fn).view(S, H)
+
+(recv_data, recv_scales), route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
+    (data, scales), route_weights_sk, topk_experts_sk, tokens_per_expert,
+    zero_copy=True,
+)
+# recv_data:   [NvS, H]        torch.float8_e4m3fn, contiguous
+# recv_scales: [NvS, H // 128] torch.float32, contiguous
+# Both follow the same expert-grouped layout; padding data and scales are zero.
+
+# Expert computation consumes recv_data/recv_scales and produces BF16 output.
+# Finish reading both FP8 inputs before writing buffer.hidden_nvsh_buffer_view;
+# that BF16 output view aliases their storage.
+output_sh, _, _ = buffer.combine(plan=plan, hidden_nvsh=expert_output_nvsh)
+```
+
+FP8 data and scales are transferred together by the dispatch kernel and
+expanded together for duplicate tokens. `plan` reuse, `async_finish`, and
+`router_weights_zero_copy` retain their existing contracts. All ranks must
+use the same activation format for a communication call. Combine continues
+to accept BF16 expert outputs or gradients.
+
+`zero_copy=True` returns views for **both** FP8 data and scales. They share
+the existing BF16 communication allocation, which the next dispatch or
+combine overwrites. Use `zero_copy=False` when either output must survive
+another communication call. The persistent communication allocation does
+not grow; it retains BF16 capacity for combine and backward dispatch.
+
+Each 128-element activation tile carries 128 bytes of FP8 data plus 4 bytes
+of scale, compared with 256 bytes in BF16: **48.44% less activation traffic**
+(or **1.94×** compression). This counts scales and excludes route weights;
+latency gains depend on workload and hardware.
+
+[benchmarks/bench_dispatch_fp8.py](benchmarks/bench_dispatch_fp8.py) compares
+BF16 and FP8 on identical inputs and routing, including scale traffic,
+planning in `fresh` mode, duplicate expansion, and output copies where enabled.
+Inputs are prequantized, so quantization, GEMM, prefetch and combine are outside
+the timed region. CUDA graph timing reports the median of samples using the
+slowest rank per replay, with alternating BF16/FP8 measurement order.
+
+```bash
+PYTHONPATH=. torchrun --nproc_per_node=8 benchmarks/bench_dispatch_fp8.py \
+    --tokens 256 2048 8192 --hidden 3584 7168 --bias 0 1 5 --out fp8_dispatch.csv
+```
+
+The CSV records the loaded MoonEP checkout's HEAD commit, a SHA-256 of its
+actual Python sources and compiled extension (including local edits), a
+benchmark-script SHA-256, and timing settings.
+`speedup_vs_run_bf16` means **BF16 latency / measured-format latency in the same
+run**; it is empty for an FP8-only run.
+
+For an upstream comparison, use the latest official `master` at a recorded
+commit. Copy this benchmark, `tests/quantization_reference.py`, and
+`tests/generate_topk_routing.py` into that checkout, build it, and run the same
+command with `--dtypes bf16` and a separate output path. Match rows by workload
+and settings, then report **upstream BF16 / branch FP8** for the feature gain
+and **branch BF16 / upstream BF16 - 1** for BF16 latency regression. The
+benchmark measures the loaded checkout; it does not switch branches.
+
 #### dispatch bwd
 
 Backward of dispatch: sum each token's K dispatched grad copies back to token-major — a combine — and reduce duplicated experts' weight grads back to their home ranks.
@@ -189,10 +268,27 @@ pip install -e .
 # run tests (requires multiple GPUs + NVLink)
 torchrun --nproc_per_node=8 -m pytest tests/test_planning.py
 torchrun --nproc_per_node=8 -m pytest tests/test_dispatch.py
+torchrun --nproc_per_node=8 -m pytest tests/test_dispatch_fp8.py
 torchrun --nproc_per_node=8 -m pytest tests/test_combine.py
 torchrun --nproc_per_node=8 -m pytest tests/test_e2e.py
 torchrun --nproc_per_node=8 -m pytest tests/test_grad_reduce.py
 torchrun --nproc_per_node=8 -m pytest tests/test_prefetch.py
+```
+
+FP8 tests can also run on two NVLink-connected GPUs for a quicker check:
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m pytest -q tests/test_dispatch_fp8.py
+```
+
+`torchrun` starts one process per GPU. Every process runs the same cases in
+the same order so the distributed collectives can cooperate. Plain `pytest`
+skips these tests without a distributed process group. Use eight GPUs to
+validate the full EP=8 topology, including the existing BF16 paths:
+
+```bash
+torchrun --standalone --nproc_per_node=8 -m pytest -q \
+    tests/test_dispatch_fp8.py tests/test_dispatch.py tests/test_combine.py
 ```
 
 ## Acknowledgments

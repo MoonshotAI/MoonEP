@@ -15,3 +15,6 @@ KIDX_BITS = 7
 # structure generation hides under the dispatch NVLink transfer. The exposed
 # tail flattens out beyond a few warps, so 4 is the sweet spot.
 DEDUP_BUILDER_WARPS = 4
+
+# DeepSeek activation quantization: one fp32 dequantization scale per 1x128 tile.
+FP8_TILE_SIZE = 128

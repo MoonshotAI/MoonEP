@@ -21,7 +21,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
-from cutlass import BFloat16, Int32, Int64, Uint32
+from cutlass import BFloat16, Int32, Int64, Uint8, Uint32
 from cutlass.cute.runtime import make_ptr
 
 from moonep._common import (
@@ -39,6 +39,7 @@ from moonep._common import (
 from moonep.constants import (
     KIDX_BITS,
     DEDUP_BUILDER_WARPS,
+    FP8_TILE_SIZE,
 )
 from moonep.planning import MoonEPCommPlan, warp_inclusive_scan
 
@@ -96,8 +97,23 @@ class DispatchKernel:
         build_dedup_map: bool,
         smem_budget: int,
         pdl_trigger: bool,
+        use_fp8: bool = False,
+        scale_stride0: int = 0,
+        scale_stride1: int = 0,
+        scale_bulk: bool = False,
     ):
         self.H = H
+        self.use_fp8 = use_fp8
+        self.elem_type = Uint8 if use_fp8 else BFloat16
+        self.elem_bytes = 1 if use_fp8 else 2
+        self.scale_stride0 = scale_stride0
+        self.scale_stride1 = scale_stride1
+        # With 16-B aligned row-major scale rows, the producer stages each
+        # scale row with the payload row under the same mbarrier, so the
+        # consumer reads scales from smem instead of global memory.
+        assert not scale_bulk or use_fp8
+        self.scale_bulk = scale_bulk
+        self.scale_row_bytes = H // FP8_TILE_SIZE * 4 if scale_bulk else 0
         self.R = R
         self.S = S
         self.K = K
@@ -113,32 +129,40 @@ class DispatchKernel:
         self.num_threads = (
             96 + 32 * DEDUP_BUILDER_WARPS if build_dedup_map else 96
         )
-        self.stages = self._pick_stages(H, smem_budget)
+        self.stages = self._pick_stages(
+            H, smem_budget, self.elem_bytes, self.scale_row_bytes,
+        )
         if self.stages == 0:
             raise RuntimeError(
                 f"dispatch: H={H} too large for per-block smem budget "
                 f"{smem_budget} B (need at least "
-                f"{self._smem_bytes(H, 2)} B)"
+                f"{self._smem_bytes(H, 2, self.elem_bytes, self.scale_row_bytes)} B)"
             )
 
     @classmethod
-    def _smem_bytes(cls, H: int, stages: int) -> int:
-        # stage_smem (bf16, kStages deep) + 2 mbar i64 per stage (full+empty).
-        # Pad stage_smem to 128 B for byte_alignment, mbar block
-        # to 16 B, plus 256 B headroom for any cutlass-internal static smem.
+    def _smem_bytes(
+        cls, H: int, stages: int, elem_bytes: int = 2, scale_row_bytes: int = 0,
+    ) -> int:
+        # stage_smem (payload, kStages deep) + optional scale stages + 2 mbar
+        # i64 per stage (full+empty). Pad stage_smem to 128 B for
+        # byte_alignment, scale/mbar blocks to 16 B, plus 256 B headroom for
+        # any cutlass-internal static smem.
         def _round_up(n: int, a: int) -> int:
             return (n + a - 1) // a * a
         return (
-            _round_up(stages * H * 2, 128)
-            + _round_up(H * 2, 128)
+            _round_up(stages * H * elem_bytes, 128)
+            + _round_up(stages * scale_row_bytes, 16)
+            + _round_up(H * elem_bytes, 128)
             + _round_up(stages * 2 * 8, 16)
             + 256
         )
 
     @classmethod
-    def _pick_stages(cls, H: int, smem_budget: int) -> int:
+    def _pick_stages(
+        cls, H: int, smem_budget: int, elem_bytes: int = 2, scale_row_bytes: int = 0,
+    ) -> int:
         for s in (16, 14, 12, 10, 8, 6, 4, 2):
-            if cls._smem_bytes(H, s) <= smem_budget:
+            if cls._smem_bytes(H, s, elem_bytes, scale_row_bytes) <= smem_budget:
                 return s
         return 0
 
@@ -147,8 +171,10 @@ class DispatchKernel:
     @cute.jit
     def __call__(
         self,
-        hidden_sh_ptr: cute.Pointer,          # bf16 [S, H]
-        hidden_buf_ptr: cute.Pointer,         # bf16 [R*NvS_padded, H]
+        hidden_sh_ptr: cute.Pointer,          # bf16 or fp8 [S, H]
+        hidden_buf_ptr: cute.Pointer,         # payload, physical rank stride NvS_padded*H
+        scales_sh_ptr: cute.Pointer,          # int32 bits of fp32 [S, H/128]
+        scales_buf_ptr: cute.Pointer,         # first rank's scale region
         weights_ptr: cute.Pointer,            # int32 view of fp32 [S, K] (or placeholder)
         dst_ptr: cute.Pointer,                # int32 [N=S*K]
         meta_ptr: cute.Pointer,               # int32 [R*meta_stride]
@@ -188,6 +214,22 @@ class DispatchKernel:
             hidden_buf_ptr,
             cute.make_layout((out_rows, H), stride=(H64, cutlass.Int64(1))),
         )
+
+        if cutlass.const_expr(self.use_fp8):
+            num_scales = H // FP8_TILE_SIZE
+            scales_src = cute.make_tensor(
+                scales_sh_ptr,
+                cute.make_layout((S, num_scales), stride=(
+                    Int64(self.scale_stride0), Int64(self.scale_stride1))),
+            )
+            scales_dst = cute.make_tensor(
+                scales_buf_ptr,
+                cute.make_layout((R, NvS, num_scales), stride=(
+                    Int64(NvS_padded * H // 4), Int64(num_scales), Int64(1))),
+            )
+        else:
+            scales_src = cute.make_tensor(scales_sh_ptr, cute.make_layout((1, 1)))
+            scales_dst = cute.make_tensor(scales_buf_ptr, cute.make_layout((1, 1, 1)))
 
         dst_tensor = cute.make_tensor(
             dst_ptr, cute.make_layout((S * K,))
@@ -235,11 +277,13 @@ class DispatchKernel:
             builder_bar_ptr, cute.make_layout((1,))
         )
 
-        smem_bytes = self._smem_bytes(H, stages)
+        smem_bytes = self._smem_bytes(H, stages, self.elem_bytes, self.scale_row_bytes)
 
         self.kernel(
             gmem_src,
             gmem_dst,
+            scales_src,
+            scales_dst,
             dst_tensor,
             meta_tensor,
             w_tensor,
@@ -270,6 +314,8 @@ class DispatchKernel:
         self,
         gmem_src: cute.Tensor,
         gmem_dst: cute.Tensor,
+        scales_src: cute.Tensor,
+        scales_dst: cute.Tensor,
         dst_tensor: cute.Tensor,
         meta_tensor: cute.Tensor,
         w_tensor: cute.Tensor,
@@ -298,7 +344,9 @@ class DispatchKernel:
         num_sms = cutlass.const_expr(self.num_sms)
         num_threads = cutlass.const_expr(self.num_threads)
         num_ranks = cutlass.const_expr(self.R)
-        H_BYTES = cutlass.const_expr(H * 2)
+        H_BYTES = cutlass.const_expr(H * self.elem_bytes)
+        SCALE_BYTES = cutlass.const_expr(self.scale_row_bytes)
+        NUM_SCALES = cutlass.const_expr(H // FP8_TILE_SIZE)
         # Offset of the per-rank src_info scratch written by planning.
         SRC_INFO_OFF = cutlass.const_expr(self.SRC_INFO_OFF)
         # src_info mirrors dst's rank-stride encoding:
@@ -315,12 +363,18 @@ class DispatchKernel:
         smem = utils.SmemAllocator()
         load_mbar = smem.allocate_array(Int64, num_elems=2 * stages)
         stage_smem = smem.allocate_tensor(
-            BFloat16,
+            self.elem_type,
             cute.make_ordered_layout((H, stages), order=(0, 1)),
             byte_alignment=128,
         )
+        if cutlass.const_expr(self.scale_bulk):
+            scale_smem = smem.allocate_tensor(
+                Int32,
+                cute.make_ordered_layout((NUM_SCALES, stages), order=(0, 1)),
+                byte_alignment=16,
+            )
         zero_smem = smem.allocate_tensor(
-            BFloat16,
+            self.elem_type,
             cute.make_layout((H,)),
             byte_alignment=128,
         )
@@ -333,18 +387,18 @@ class DispatchKernel:
             num_stages=stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=H * 2,
+            tx_count=H_BYTES + SCALE_BYTES,
         )
 
         # ----- zero_smem one-shot init (reused by every padding s2g from
-        # warp 2). All NUM_THREADS cooperatively zero H bf16 elements, then
+        # warp 2). All NUM_THREADS cooperatively zero H payload elements, then
         # a single fence publishes the cta-scoped smem writes to the
         # cp.async.bulk async proxy for the rest of the kernel.
         H_PER_THR_ZERO = cutlass.const_expr((H + num_threads - 1) // num_threads)
         for j in cutlass.range_constexpr(H_PER_THR_ZERO):
             idx = j * num_threads + tidx
             if idx < Int32(H):
-                zero_smem[idx] = BFloat16(0)
+                zero_smem[idx] = self.elem_type(0)
         cute.arch.fence_view_async_shared()
         cute.arch.barrier()
 
@@ -379,6 +433,20 @@ class DispatchKernel:
                         Int32(H_BYTES).ir_value(),
                         mbar_int.ir_value(),
                     )
+                    if cutlass.const_expr(self.scale_bulk):
+                        g_scale_int = (
+                            scales_src.iterator
+                            + cutlass.Int64(s) * cutlass.Int64(NUM_SCALES)
+                        ).toint()
+                        s_scale_int = (
+                            scale_smem.iterator + load_state.index * NUM_SCALES
+                        ).toint()
+                        cp_async_bulk_g2s(
+                            s_scale_int.ir_value(),
+                            g_scale_int.ir_value(),
+                            Int32(SCALE_BYTES).ir_value(),
+                            mbar_int.ir_value(),
+                        )
                 load_state.advance()
 
         # ============================================
@@ -415,7 +483,7 @@ class DispatchKernel:
                         loff = raw_dst % NvS
 
                         if store_token:
-                            drow = drank * NvS_padded + loff
+                            drow = cutlass.Int64(drank) * cutlass.Int64(NvS_padded) + loff
                             g_row_int = (
                                 gmem_dst.iterator
                                 + cutlass.Int64(drow) * cutlass.Int64(H)
@@ -432,6 +500,21 @@ class DispatchKernel:
                                 drank * meta_stride + weights_off + loff
                             ] = wb
                     cute.arch.cp_async_bulk_commit_group()
+
+                if cutlass.const_expr(self.use_fp8):
+                    # The same consumer warp scatters the scale bits. As with
+                    # the payload, only representative rows cross NVLink.
+                    for tile in cutlass.range_constexpr((NUM_SCALES + 31) // 32):
+                        col = tile * 32 + cute.arch.lane_idx()
+                        if col < Int32(NUM_SCALES):
+                            if cutlass.const_expr(self.scale_bulk):
+                                scale = scale_smem[col, use_state.index]
+                            else:
+                                scale = scales_src[s, col]
+                            for k in cutlass.range(K, unroll=1):
+                                scale_dst = dst_tensor[sK + k]
+                                if scale_dst >= Int32(0):
+                                    scales_dst[scale_dst // NvS, scale_dst % NvS, col] = scale
 
                 use_state.advance()
 
@@ -473,7 +556,7 @@ class DispatchKernel:
                 if n_pad > Int32(0):
                     for j in cutlass.range(n_pad, unroll=1):
                         loff = pad_start + Int32(j)
-                        local_row = Int32(rank) * Int32(NvS_padded) + loff
+                        local_row = cutlass.Int64(rank) * cutlass.Int64(NvS_padded) + loff
                         if cute.arch.lane_idx() == 0:
                             g_row_int = (
                                 gmem_dst.iterator
@@ -490,6 +573,11 @@ class DispatchKernel:
                                 meta_tensor[
                                     Int32(rank) * meta_stride + weights_off + loff
                                 ] = Int32(0)
+                        if cutlass.const_expr(self.use_fp8):
+                            for tile in cutlass.range_constexpr((H // FP8_TILE_SIZE + 31) // 32):
+                                col = tile * 32 + cute.arch.lane_idx()
+                                if col < H // FP8_TILE_SIZE:
+                                    scales_dst[rank, loff, col] = Int32(0)
                         if issued >= Int32(stages - 1):
                             cute.arch.cp_async_bulk_wait_group(stages - 1)
                         issued += Int32(1)
@@ -680,7 +768,7 @@ class DispatchKernel:
                                 my_grp += Int32(1)
                                 my_dup += dup_count
 
-        # ----- exit barrier: dispatch wrote NVL hidden_buf / weight slots.
+        # ----- exit barrier: dispatch wrote NVL hidden, scale and weight slots.
         # cross_rank_barrier uses grid_sync plus system-scope release/acquire
         # atomics to publish the whole grid's writes to peer ranks before the
         # local epilogue reads those rows.
@@ -717,6 +805,10 @@ def _get_compiled(
     build_dedup_map: bool,
     device_index: int,
     pdl_trigger: bool,
+    use_fp8: bool = False,
+    scale_stride0: int = 0,
+    scale_stride1: int = 0,
+    scale_bulk: bool = False,
 ):
     smem_budget = _max_smem_per_block_optin(device_index) - 1024
     kernel = DispatchKernel(
@@ -728,17 +820,25 @@ def _get_compiled(
         build_dedup_map=build_dedup_map,
         smem_budget=smem_budget,
         pdl_trigger=pdl_trigger,
+        use_fp8=use_fp8,
+        scale_stride0=scale_stride0,
+        scale_stride1=scale_stride1,
+        scale_bulk=scale_bulk,
     )
 
-    bf16_ptr = make_ptr(BFloat16, 0, cute.AddressSpace.gmem, assumed_align=16)
+    payload_ptr = make_ptr(Uint8 if use_fp8 else BFloat16, 0, cute.AddressSpace.gmem, assumed_align=16)
+    scale_ptr = make_ptr(Int32, 0, cute.AddressSpace.gmem,
+                         assumed_align=16 if scale_bulk else 4)
     i32_ptr = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=16)
     u32_ptr = make_ptr(Uint32, 0, cute.AddressSpace.gmem, assumed_align=16)
     stream_arg = cuda.CUstream(0)
 
     return cute.compile(
         kernel,
-        bf16_ptr,  # hidden_sh
-        bf16_ptr,  # hidden_buf
+        payload_ptr,  # hidden_sh
+        payload_ptr,  # hidden_buf
+        scale_ptr,    # input fp32 scale bits
+        scale_ptr,    # NVL fp32 scale bits
         i32_ptr,   # weights (int32 view of fp32)
         i32_ptr,   # dst
         i32_ptr,   # meta
@@ -835,6 +935,32 @@ def _check_dedup_builder_tensors(ctx: dict, dev: torch.device) -> None:
     _check_scratch("builder_bar", 1)
 
 
+def check_dispatch_input(ctx: dict, hidden_sh):
+    """Validate before planning/communication, and unpack DeepEP-style FP8 input."""
+    scales = None
+    if isinstance(hidden_sh, tuple):
+        assert len(hidden_sh) == 2, "FP8 input must be a (data, scales) tuple"
+        hidden_sh, scales = hidden_sh
+        assert isinstance(hidden_sh, torch.Tensor) and hidden_sh.dtype == torch.float8_e4m3fn, \
+            "FP8 data must have dtype torch.float8_e4m3fn"
+        assert int(ctx['H']) % FP8_TILE_SIZE == 0, "FP8 requires H divisible by 128"
+        assert isinstance(scales, torch.Tensor) and scales.dtype == torch.float32, \
+            "FP8 scales must have dtype torch.float32"
+        assert tuple(scales.shape) == (int(ctx['S']), int(ctx['H']) // FP8_TILE_SIZE), \
+            "FP8 scales must be shape [S, H // 128]"
+        assert scales.device == hidden_sh.device, "FP8 scales must be on the same device as data"
+    else:
+        assert isinstance(hidden_sh, torch.Tensor) and hidden_sh.dtype == torch.bfloat16, \
+            "hidden_sh must be bf16 or an (FP8 data, fp32 scales) tuple"
+    assert hidden_sh.is_cuda, "hidden_sh must be a CUDA tensor"
+    assert hidden_sh.device == ctx['hidden_buf'].device, "hidden_sh must be on the buffer device"
+    assert hidden_sh.is_contiguous(), "hidden_sh must be contiguous"
+    assert tuple(hidden_sh.shape) == (int(ctx['S']), int(ctx['H'])), \
+        "hidden_sh must be shape [S, H]"
+    assert hidden_sh.data_ptr() % 16 == 0, "hidden_sh must be 16-byte aligned"
+    return hidden_sh, scales
+
+
 def launch_dispatch(
     ctx: dict,
     hidden_sh,
@@ -847,7 +973,7 @@ def launch_dispatch(
     """Launch the dispatch kernel.
 
     Args:
-        hidden_sh: [S, H] bf16 source hidden states.
+        hidden_sh: [S, H] bf16, or (fp8 [S, H], fp32 scales [S, H // 128]).
         route_weights_sk: [S, K] fp32 route weights, or None to skip the
             weights scatter (placeholder tensor is passed to satisfy the
             non-null pointer constraint; the kernel ignores it when
@@ -867,6 +993,8 @@ def launch_dispatch(
     stream.
     """
     assert isinstance(plan, MoonEPCommPlan)
+    hidden_sh, hidden_scales = check_dispatch_input(ctx, hidden_sh)
+    use_fp8 = hidden_scales is not None
     with_weights = route_weights_sk is not None
     if not with_weights:
         # Placeholder; kernel will not dereference.
@@ -879,11 +1007,6 @@ def launch_dispatch(
     E = int(ctx['E'])
     epn = E // R
 
-    assert hidden_sh.dtype == torch.bfloat16 and hidden_sh.is_contiguous(), \
-        "hidden_sh must be contiguous bf16"
-    assert hidden_sh.is_cuda, "hidden_sh must be a CUDA tensor"
-    assert tuple(hidden_sh.shape) == (S, H), \
-        f"hidden_sh must be shape [S={S}, H={H}], got {tuple(hidden_sh.shape)}"
     _check_dispatch_plan(ctx, hidden_sh, plan)
     assert ctx['hidden_buf'].dtype == torch.bfloat16 and ctx['hidden_buf'].is_contiguous()
     assert ctx['hidden_buf'].device == hidden_sh.device
@@ -904,16 +1027,32 @@ def launch_dispatch(
         _check_dedup_builder_tensors(ctx, hidden_sh.device)
 
     NvS = int(ctx['NvS'])
-    NvS_padded = int(ctx['NvS_padded'])
+    # The allocation keeps its bf16 byte stride between ranks. In an fp8
+    # view this stride spans twice as many H-byte rows; scales occupy the tail.
+    NvS_padded = int(ctx['NvS_padded']) * (2 if use_fp8 else 1)
     meta_stride = int(ctx['meta_chunk_padded'])
     SRC_INFO_OFF = int(ctx['SRC_INFO_OFF'])
     num_sms = int(ctx['num_sms'])
     device_index = hidden_sh.device.index
+    # cp.async.bulk needs 16-B sizes and addresses. NVL scale rows always
+    # satisfy that when H % 512 == 0; the input must be row-major and aligned.
+    scale_bulk = (
+        use_fp8
+        and (H // FP8_TILE_SIZE * 4) % 16 == 0
+        and hidden_scales.is_contiguous()
+        and hidden_scales.data_ptr() % 16 == 0
+    )
+    if scale_bulk:
+        scale_strides = (H // FP8_TILE_SIZE, 1)
+    elif use_fp8:
+        scale_strides = (hidden_scales.stride(0), hidden_scales.stride(1))
+    else:
+        scale_strides = (0, 0)
 
     dispatch_compiled = _get_compiled(
         H, R, S, K, 2 * epn, NvS, NvS_padded, meta_stride, SRC_INFO_OFF,
         num_sms, with_weights, build_dedup_map, device_index,
-        bool(pdl_trigger),
+        bool(pdl_trigger), use_fp8, *scale_strides, scale_bulk,
     )
 
     # int32 view onto fp32 weights so the kernel always sees an int32 ptr
@@ -922,10 +1061,20 @@ def launch_dispatch(
         route_weights_sk.view(torch.int32) if with_weights else route_weights_sk
     )
 
-    hsh_ptr = make_ptr(BFloat16, hidden_sh.data_ptr(), cute.AddressSpace.gmem,
+    elem_type = Uint8 if use_fp8 else BFloat16
+    hsh_ptr = make_ptr(elem_type, hidden_sh.data_ptr(), cute.AddressSpace.gmem,
                        assumed_align=16)
-    hbf_ptr = make_ptr(BFloat16, ctx['hidden_buf'].data_ptr(),
+    hbf_ptr = make_ptr(elem_type, ctx['hidden_buf'].data_ptr(),
                        cute.AddressSpace.gmem, assumed_align=16)
+    scale_align = 16 if scale_bulk else 4
+    scales_sh_ptr = make_ptr(
+        Int32, (hidden_scales if use_fp8 else plan.dst).data_ptr(),
+        cute.AddressSpace.gmem, assumed_align=scale_align,
+    )
+    scales_buf_ptr = make_ptr(
+        Int32, ctx['hidden_buf'].data_ptr() + (int(ctx['NvS_padded']) * H if use_fp8 else 0),
+        cute.AddressSpace.gmem, assumed_align=scale_align,
+    )
     w_ptr = make_ptr(Int32, w_int.data_ptr(), cute.AddressSpace.gmem,
                      assumed_align=16)
     dst_ptr = make_ptr(Int32, plan.dst.data_ptr(), cute.AddressSpace.gmem,
@@ -964,6 +1113,8 @@ def launch_dispatch(
     dispatch_compiled(
         hsh_ptr,
         hbf_ptr,
+        scales_sh_ptr,
+        scales_buf_ptr,
         w_ptr,
         dst_ptr,
         meta_ptr,
