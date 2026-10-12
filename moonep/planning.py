@@ -156,6 +156,22 @@ def multimem_st_v4(addr_i64, x, y, z, w, *, loc=None, ip=None) -> None:
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
 
 
+@dsl_user_op
+def multimem_st_b32(addr_i64, x, *, loc=None, ip=None) -> None:
+    """One 32-bit multimem store: the scalar tail of the vectorized publish.
+
+    Same target, scope and relaxed ordering as ``multimem_st_v4``; the value is
+    passed through as raw bits, so int32 payloads are not reinterpreted.
+    """
+    llvm.inline_asm(
+        None,
+        [addr_i64, Uint32(x).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .u64 g;\n\t cvta.to.global.u64 g, $0;\n\t"
+        "multimem.st.relaxed.sys.global.b32 [g], $1;\n\t}",
+        "l,r", has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
 @cute.jit
 def warp_inclusive_scan(v, lane):
     offset = 1
@@ -914,12 +930,32 @@ class PlanningKernel:
                         base += padded_values[i]
                 cute.arch.barrier()
             grid_sync(bar_p, num_sms, tid)
-            nb = 3 * E * R; nvec = nb // 4
-            for i in cutlass.range(pid * num_threads + tid, nvec, num_sms * num_threads):
-                a0 = meta[PB + i * 4 + 0]; a1 = meta[PB + i * 4 + 1]
-                a2 = meta[PB + i * 4 + 2]; a3 = meta[PB + i * 4 + 3]
-                addr = (mc.iterator + (PLAN_OFF + i * 4)).toint()
-                multimem_st_v4(addr.ir_value(), a0, a1, a2, a3)
+            # Replicate ALLOC | TPE | EOFF into every peer chunk: each rank
+            # reads those three sub-regions from its own chunk (plo = rank * ms
+            # + PLAN_OFF below). CU | ZFR | ETC | STATS are read from rank 0's
+            # chunk by every rank, so this publish is the only writer of a peer
+            # chunk's plan and nothing republishes an element it drops. The v4
+            # body covers whole 16B groups; nb = 3 * E * R is not necessarily a
+            # multiple of 4, so the trailing nb % 4 entries -- the last EOFF
+            # entries, i.e. the top experts' destination offsets -- need the
+            # scalar store. Both loops share one grid-wide worker numbering, so
+            # every element is written exactly once and the scalar region never
+            # overlaps the vector body. R = 1 has no peer chunk and the plan is
+            # already in rank 0's own chunk, where the publish is a self-copy.
+            if cutlass.const_expr(R > 1):
+                nb = 3 * E * R
+                nvec = nb // 4
+                worker = pid * num_threads + tid
+                workers = num_sms * num_threads
+                for i in cutlass.range(worker, nvec, workers):
+                    a0 = meta[PB + i * 4 + 0]; a1 = meta[PB + i * 4 + 1]
+                    a2 = meta[PB + i * 4 + 2]; a3 = meta[PB + i * 4 + 3]
+                    addr = (mc.iterator + (PLAN_OFF + i * 4)).toint()
+                    multimem_st_v4(addr.ir_value(), a0, a1, a2, a3)
+                if cutlass.const_expr(nb % 4 != 0):
+                    for i in cutlass.range(nvec * 4 + worker, nb, workers):
+                        addr = (mc.iterator + (PLAN_OFF + i)).toint()
+                        multimem_st_b32(addr.ir_value(), meta[PB + i])
         order = cute.make_tensor(meta.iterator + (rank * ms + ORDER_OFF), cute.make_layout((N,)))
         if cutlass.const_expr(R > 1):
             if rank != 0:

@@ -299,10 +299,9 @@ def _create_context(
     WEIGHTS_OFF = 0
     TPE_OFF = _align_up(NvS, 4)
     PLAN_OFF = _align_up(TPE_OFF + R * E, 4)
+    # ALLOC | TPE | EOFF, broadcast by the planner as a vectorized multimem
+    # body plus a scalar tail for the trailing 3 * E * R % 4 elements.
     broadcast_elems = 3 * E * R
-    assert broadcast_elems % 4 == 0, (
-        f"broadcast_elems ({broadcast_elems}) must be divisible by 4"
-    )
     planning_out_elems = (
         broadcast_elems
         + R * (2 * epn)
