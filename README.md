@@ -44,6 +44,8 @@ where $T_e$ is the number of tokens routed to expert $e$, and $\bar{T}$ is the e
 
 MoonEP's communication API receives each projection as a local expert tensor `[epn, H, H']` plus an all-rank prefetch-buffer view `[R, epn, H, H']`. The integrating framework exposes this rank's local experts followed by its local prefetch slice as one contiguous `[2*epn, H, H']` compute view for the VM group GEMM; the planner-produced `cu_seqlens[2*epn]` selects the active rows.
 
+Both projection dimensions of that tensor are constrained by the current implementation: **`H` and `H'` must each be a multiple of 128.** `128 × 256` satisfies this; `2880 × 4096` does not, because `H = 2880` is a multiple of 8 but not of 128. These are tile-shape requirements of the current kernels — `prefetch_weight` and `reduce_grad` tile at 128, and `combine` accumulates `H` with 128 threads — not memory-contiguity requirements. A contiguous range that violates them still maps correctly and then fails an assertion inside the kernel launch. For the packed (`uint8`) and retiled quantization paths, the requirement applies to the physical tensor dimensions actually passed to those kernels, which are not necessarily the model's logical `H` and `H'`.
+
 #### Weight buffer
 
 <img src="figure/weight_buffer.png" alt="MoonEP weight buffer layout" width="1000">
