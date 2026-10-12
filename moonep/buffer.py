@@ -153,15 +153,22 @@ def _exchange_ipc_fds(
                              os.path.join(dir_path, f"rank_{dst}"))
 
         fds = {}
-        while len(fds) < len(sender_ranks):
-            msg, ancdata, _flags, _addr = sock.recvmsg(16, socket.CMSG_SPACE(4))
-            src_rank = struct.unpack("<i", msg[:4])[0]
-            for level, ctype, cdata in ancdata:
-                if level == socket.SOL_SOCKET and ctype == socket.SCM_RIGHTS:
-                    fds[src_rank] = struct.unpack("<i", cdata[:4])[0]
-                    break
-            else:
-                raise RuntimeError("received IPC message without an fd")
+        try:
+            while len(fds) < len(sender_ranks):
+                msg, ancdata, _flags, _addr = sock.recvmsg(16, socket.CMSG_SPACE(4))
+                src_rank = struct.unpack("<i", msg[:4])[0]
+                for level, ctype, cdata in ancdata:
+                    if level == socket.SOL_SOCKET and ctype == socket.SCM_RIGHTS:
+                        fds[src_rank] = struct.unpack("<i", cdata[:4])[0]
+                        break
+                else:
+                    raise RuntimeError("received IPC message without an fd")
+        except Exception:
+            # SCM_RIGHTS fds are plain ints owned by this process; sock.close()
+            # below does not close them, so drop any already received.
+            for fd in fds.values():
+                os.close(fd)
+            raise
     finally:
         sock.close()
         # Everyone has received their fds; safe to tear down the sockets and
@@ -194,9 +201,11 @@ def _map_nvl_dist_tensor(
         )
     else:
         local_fd = int(shareable.item())
-        fds = _exchange_ipc_fds(local_fd, list(range(world_size)),
-                                local_rank, world_size, group)
-        os.close(local_fd)
+        try:
+            fds = _exchange_ipc_fds(local_fd, list(range(world_size)),
+                                    local_rank, world_size, group)
+        finally:
+            os.close(local_fd)
         all_fds = [fds[r] for r in range(world_size)]
         try:
             full_tensor = nvl_dist_map(
@@ -308,22 +317,33 @@ def _create_nvl_multicast_view(
     else:
         mc_handle, mc_shareable = 0, None
 
-    if use_fabric:
-        root_handle = _broadcast_shareable(mc_shareable, 0, group)
-        if not is_root:
-            mc_handle = nvl_multicast_import(root_handle, use_fabric=True)
-    else:
-        local_fd = int(mc_shareable.item()) if is_root else None
-        fds = _exchange_ipc_fds(local_fd, [0], local_rank, world_size, group)
-        if is_root:
-            os.close(local_fd)
-        root_fd = fds[0]
-        try:
+    try:
+        if use_fabric:
+            root_handle = _broadcast_shareable(mc_shareable, 0, group)
             if not is_root:
-                mc_handle = nvl_multicast_import(
-                    torch.tensor(root_fd, dtype=torch.int64), use_fabric=False)
-        finally:
-            os.close(root_fd)
+                mc_handle = nvl_multicast_import(root_handle, use_fabric=True)
+        else:
+            local_fd = int(mc_shareable.item()) if is_root else None
+            try:
+                fds = _exchange_ipc_fds(local_fd, [0], local_rank, world_size,
+                                        group)
+            finally:
+                if is_root:
+                    os.close(local_fd)
+            root_fd = fds[0]
+            try:
+                if not is_root:
+                    mc_handle = nvl_multicast_import(
+                        torch.tensor(root_fd, dtype=torch.int64),
+                        use_fabric=False)
+            finally:
+                os.close(root_fd)
+    except Exception:
+        # The multicast object handle is a CUmemGenericAllocationHandle; if the
+        # exchange or import fails there is no owner left to release it.
+        if is_root:
+            nvl_release_mem_handle(mc_handle)
+        raise
 
     # All ranks add their device before any bind, then barrier.
     nvl_multicast_add_device(mc_handle)
@@ -369,10 +389,12 @@ def create_nvl_single_owner_tensor(
         )
     else:
         local_fd = int(shareable.item()) if is_owner else None
-        fds = _exchange_ipc_fds(local_fd, [owner_rank], local_rank,
-                                world_size, group)
-        if is_owner:
-            os.close(local_fd)
+        try:
+            fds = _exchange_ipc_fds(local_fd, [owner_rank], local_rank,
+                                    world_size, group)
+        finally:
+            if is_owner:
+                os.close(local_fd)
         owner_fd = fds[owner_rank]
         try:
             tensor = nvl_dist_map(
