@@ -1,0 +1,11 @@
+# setup.py imports torch.utils.cpp_extension at module scope to describe the CUDA
+# extension, so torch has to be present in the *build* environment as well: without
+# this file pip falls back to the PEP 517 defaults and isolates the build with only
+# setuptools + wheel, so even "getting requirements to build wheel" fails with
+# `ModuleNotFoundError: No module named 'torch'`.
+#
+# Package metadata (name, version, install_requires) deliberately stays in setup.py
+# as the single source of truth; a [project] table here would take precedence over it.
+[build-system]
+requires = ["setuptools>=64", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
