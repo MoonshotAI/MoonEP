@@ -787,7 +787,14 @@ __aicore__ inline void PublishSourceDupPayloads(
     }
     AscendC::PipeBarrier<PIPE_ALL>();
     AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
-    AscendC::SyncAll<true>();
+    // Payload publication must be complete on every rank before any core raises
+    // a done flag: a peer that observes the flag is allowed to materialize the
+    // payload bytes. mte_quiet drains this core's remote stores (PIPE_ALL +
+    // dcci); the cross-rank barrier turns "every rank published" into a global
+    // condition, which a local SyncAll cannot express because the flags travel
+    // from other cores on their own queues.
+    aclshmemx_mte_quiet();
+    aclshmemx_barrier_all_vec();
     PublishSourceDupPayloadDoneFlags(
         config,
         shmem_base,
@@ -925,6 +932,7 @@ __aicore__ inline void RunSourceDupStages(
         local_shmem_gm,
         args.payload_done_flag_offset);
     AscendC::SyncAll<true>();
+    aclshmemx_mte_quiet();
 
     MaterializeSourceDupOutputs(
         config,
@@ -936,6 +944,8 @@ __aicore__ inline void RunSourceDupStages(
         dup_loffs_gm,
         args.groups_scratch_offset,
         args.loffs_scratch_offset);
+    aclshmemx_mte_quiet();
+    aclshmemx_barrier_all_vec();
 }
 
 }  // namespace

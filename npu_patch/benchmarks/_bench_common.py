@@ -55,6 +55,8 @@ def setup():
     dist.init_process_group(
         backend="hccl", device_id=torch.device(f"npu:{device}")
     )
+    group = dist.group.WORLD
+    dist.barrier(group=group)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     return rank, world_size, local_rank

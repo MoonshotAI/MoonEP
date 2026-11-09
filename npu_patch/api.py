@@ -891,6 +891,7 @@ class Buffer:
             plan.dst, plan.experts_to_copy, plan.zero_fill_ranges,
             plan.remote_stats, plan.dup_groups, plan.dup_loffs,
             plan.dup_counts,
+            *(planning_args or ()),
         )
         # First make comm_stream wait for sync work already queued on the
         # current stream (e.g. a preceding dispatch) to drain, then launch

@@ -80,6 +80,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void prefetch_wei
     if ASCEND_IS_AIC {
         return;
     }
+    aclshmemx_sync_vec_all();
     // UDMA is shared by the whole UB and must only be driven by one AIV.
     const int32_t block = UdmaAivWorkerIndex();
     if (block != 0) {

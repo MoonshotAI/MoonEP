@@ -1888,6 +1888,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void moonep_udma_
         workspace_gm, dst_ptr, output_sh,
         S, H, K, tiling.R, NvS,
         rank, core_idx, kCombineAivNum);
+    PipeBarrier<PIPE_ALL>();
+    aclshmemx_barrier_all_vec();
 }
 
 

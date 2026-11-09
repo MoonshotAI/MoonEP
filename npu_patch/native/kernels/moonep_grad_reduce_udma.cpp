@@ -116,7 +116,12 @@ void MoonEPShmemGradReduceUdmaFused(
         }
     }
 
-    aclshmem_quiet();
+    // Every remote GET was already completed by its owning AIV via
+    // aclshmemx_udma_quiet. Do NOT use aclshmem_quiet() here: it drains every
+    // peer from every AIV, and SHMEM requires UDMA queue-state mutation
+    // (submit/quiet/poll) to be serialized per jetty. Only the local MTE3
+    // atomic-add stores still need draining.
+    aclshmemx_mte_quiet();
     aclshmemx_barrier_all_vec();
 
     if (coreIdx == 0) {

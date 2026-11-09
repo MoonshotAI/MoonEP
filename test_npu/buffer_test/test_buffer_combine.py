@@ -6,6 +6,13 @@ combine output: every token's K dispatched copies must sum back to
 This complements ``test_buffer_plan.py`` / ``test_buffer_dispatch_with_reference_plan.py``
 with an independent combine-precision check.
 
+``test_combine_shard_lifetime`` additionally drives back-to-back
+``dispatch -> combine`` rounds with ``inter_rank_sync=False`` (no host-side
+cross-rank barrier) and round-dependent payloads. The symmetric shard stays
+live across those calls, so without combine's kernel-level exit rendezvous a
+fast rank's next dispatch overwrites the shard while a slower peer is still
+reading it (remote-read final-use fence).
+
 Run with (Ascend host, CANN + torch_npu + shmem + built npu_patch):
 
     torchrun --nproc_per_node=8 -m pytest -s test_npu/buffer_test/test_buffer_combine.py
@@ -135,11 +142,98 @@ def run_case(rank, local_rank, R, case, use_udma: bool = True):
         reset_symmetric_descriptors()
 
 
+LIFETIME_S, LIFETIME_K, LIFETIME_H = 64, 4, 1024
+LIFETIME_ROUNDS = 12
+
+
+def _lifetime_hidden(rank: int, S: int, H: int, iteration: int) -> torch.Tensor:
+    # The per-round offset is far above the check tolerance: a shard slot left
+    # behind by the neighbouring round cannot pass the combine check.
+    return (hidden_sh_for(rank, S, H).float() + 8.0 * iteration).to(torch.bfloat16)
+
+
+def _lifetime_weights(rank: int, S: int, K: int, iteration: int) -> torch.Tensor:
+    return weights_sk_for(rank, S, K) + 10000.0 * iteration
+
+
+def run_lifetime_case(rank: int, local_rank: int, R: int, use_udma: bool) -> None:
+    dev = f"npu:{local_device_index(local_rank)}"
+    S, K, H = LIFETIME_S, LIFETIME_K, LIFETIME_H
+    E = R * 4
+    buffer = None
+    try:
+        buffer = Buffer(S, H, K, E, R, explicitly_destroy=True, use_udma=use_udma)
+        if not ShmemRuntime.is_initialized():
+            init_shmem(group=None, enable_udma=use_udma)
+
+        topk_all, tpe_all = generate_topk_routing(
+            S, K, E, R, 0.0, "cpu", 1234, all_ranks=True)
+        topk_this = topk_all[rank].to(dev)
+        tpe_this = tpe_all[rank].to(dev)
+        label = f"lifetime (R={R}, use_udma={use_udma})"
+
+        # Round 0 plans with the ordinary host-synchronized path; the plan is
+        # reused by every later round (same routing, changing payload).
+        hidden = _lifetime_hidden(rank, S, H, 0).to(dev)
+        weights = _lifetime_weights(rank, S, K, 0).to(dev)
+        hidden_nvsh, weights_nvs, _cu, plan = buffer.dispatch(
+            hidden, weights, topk_experts_sk=topk_this, tokens_per_expert=tpe_this)
+        hidden_out, weights_out, _ = buffer.combine(
+            plan=plan, hidden_nvsh=hidden_nvsh, route_weights_nvs=weights_nvs)
+        rounds = [(0, hidden, weights, hidden_out, weights_out)]
+
+        # Later rounds run with inter_rank_sync=False and no host synchronization
+        # between them: the kernel-level rendezvous in combine (entry barrier +
+        # remote-read final-use fence) is the only thing separating a rank's
+        # next dispatch from a slower peer's still-running shard reads.
+        for iteration in range(1, LIFETIME_ROUNDS):
+            hidden = _lifetime_hidden(rank, S, H, iteration).to(dev)
+            weights = _lifetime_weights(rank, S, K, iteration).to(dev)
+            hidden_nvsh, weights_nvs, _cu, _plan = buffer.dispatch(
+                hidden, weights, plan=plan, inter_rank_sync=False)
+            hidden_out, weights_out, _ = buffer.combine(
+                plan=plan, hidden_nvsh=hidden_nvsh,
+                route_weights_nvs=weights_nvs, inter_rank_sync=False)
+            rounds.append((iteration, hidden, weights, hidden_out, weights_out))
+
+        torch.npu.synchronize()
+        dist.barrier()
+
+        for iteration, hidden, weights, hidden_out, weights_out in rounds:
+            golden = (K * hidden.float()).to(torch.bfloat16)
+            assert_close_all_ranks(
+                f"{label} round {iteration} combine hidden",
+                hidden_out.cpu().float(), golden.cpu().float(), rank, R)
+            ok = torch.equal(weights_out.cpu(), weights.cpu())
+            flag = torch.tensor([int(ok)], dtype=torch.int32, device=dev)
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+            assert int(flag.item()) == 1, (
+                f"{label} round {iteration} weights round-trip")
+
+        if rank == 0:
+            print(f"  [PASS] {label}, rounds={LIFETIME_ROUNDS}")
+        dist.barrier()
+    finally:
+        ShmemRuntime.finalize()
+        if buffer is not None:
+            buffer.destroy()
+        reset_symmetric_descriptors()
+
+
 @pytest.mark.parametrize("use_udma", [True, False], ids=["urma", "mte"])
 @pytest.mark.parametrize("case", CASES, ids=[c["name"] for c in CASES])
 def test_buffer_combine(dist_env, case, use_udma):
     rank, local_rank, R = dist_env
     run_case(rank, local_rank, R, case, use_udma)
+
+
+@pytest.mark.parametrize("use_udma", [True, False], ids=["urma", "mte"])
+def test_combine_shard_lifetime(dist_env, use_udma):
+    rank, local_rank, R = dist_env
+    if rank == 0:
+        print(f"[test_combine_shard_lifetime] R={R} use_udma={use_udma} "
+              f"rounds={LIFETIME_ROUNDS}")
+    run_lifetime_case(rank, local_rank, R, use_udma)
 
 
 if __name__ == "__main__":

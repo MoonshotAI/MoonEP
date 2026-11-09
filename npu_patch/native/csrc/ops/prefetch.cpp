@@ -6,7 +6,6 @@
 
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
-#include "shmem.h"
 #include "ascend_moonep/kernels/launch.h"
 #include "csrc/common/check.h"
 #include "csrc/shmem_instance.h"
@@ -96,7 +95,6 @@ torch::Tensor LaunchPrefetch(
     const int64_t block_dim = aicore_count;
 
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-    aclshmemx_barrier_all_on_stream(stream);
 #if defined(ASCEND_MOONEP_UDMA)
     auto kernel = use_udma
         ? prefetch_weight_kernel_udma_do
@@ -117,7 +115,6 @@ torch::Tensor LaunchPrefetch(
         Hp,
         B,
         block_dim);
-    aclshmemx_barrier_all_on_stream(stream);
     return prefetch_buffers;
 }
 

@@ -168,11 +168,11 @@ def create_full_grad_and_reduce_buffer(
         E, B, R, H, Hp, dtype, device, rank)
     home.copy_(grad_table[rank * epn:(rank + 1) * epn])
     slot.copy_(reduce_table[rank])
-    # Pre-init [R,B,H,H'] carrier. Its storage is not read by reduce_grad; only
-    # the attached slot source VA is consumed. read_reduce_slot() resolves each
-    # rank's live slot chunk from it.
-    reduce_buffer = torch.empty(
-        R, B, H, Hp, dtype=dtype, device=torch.device(f"npu:{device}"))
+    # Logical [R,B,H,H'] over the local slot chunk: every rank slice is a
+    # stride-0 alias, so this process backs only epn*H*H' floats and slice
+    # [rank] *is* the local chunk the reduce kernel consumes. No storage exists
+    # for the other ranks; remote reads go through read_reduce_slot().
+    reduce_buffer = slot.unsqueeze(0).expand(R, -1, -1, -1)
     buffer_c.attach_local_source_vas(
         reduce_buffer, home.data_ptr(), slot.data_ptr())
     reduce_buffer._npu_slot_chunk = slot

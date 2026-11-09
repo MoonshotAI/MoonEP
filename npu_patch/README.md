@@ -374,9 +374,10 @@ buffer.reduce_grad(
 - `zero_copy=True`：dispatch 返回本地对称分片的视图（`hidden_buf_local` /
   `weights_buf_local`，远程 rank 已直接写入）；combine 的 `hidden_nvsh` 必须
   别名该视图（`data_ptr` 相同），否则断言失败。
-- `async_finish=True`：返回 `torch.npu.Event`。当前实现是兼容 shim——仍在
-  current stream 上执行，随后设备同步 + 跨 rank 重排，避免连续 async 操作共享
-  shmem 栅栏代际而死锁（跨 rank kernel 内含设备侧全 rank 栅栏）。
+- `async_finish=True`：返回 `torch.npu.Event`。dispatch/combine 与 prefetch 都在
+  comm stream 上异步执行，host 不额外同步；prefetch 的跨 rank 顺序由 kernel 内的
+  pre/post vector collective 保证（与 dispatch kernel 同一种实现）。所有 rank 必须
+  以相同顺序进入这些集合操作。
 - 断言级参考见 `test_npu/mte/test_e2e.py` 与 `test_npu/urma/test_e2e_urma.py`
   （含 plan 复用、zero_copy、async、prefetch 投影读回、grad reduce 参考校验）。
 

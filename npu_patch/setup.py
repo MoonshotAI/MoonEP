@@ -170,7 +170,7 @@ def _npu_extension():
         include_dirs=include_dirs,
         library_dirs=library_dirs,
         libraries=["ascend_moonep_kernels", "torch_npu", "ascendcl", "runtime", "shmem", "dl"],
-        extra_compile_args=["-O2", "-std=c++17"],
+        extra_compile_args=["-O2", "-std=c++20"],
         extra_link_args=["-Wl,-rpath,$ORIGIN/lib"]
         + [f"-Wl,-rpath,{path}" for path in rpath_dirs],
     )

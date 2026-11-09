@@ -1551,7 +1551,14 @@ __aicore__ inline void PublishSourceDupPayloads(
     }
     AscendC::PipeBarrier<PIPE_ALL>();
     AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
-    AscendC::SyncAll<true>();
+    // Payload publication must be complete on every rank before any core raises
+    // a done flag: a peer that observes the flag is allowed to materialize the
+    // payload bytes. mte_quiet drains this core's remote stores (PIPE_ALL +
+    // dcci); the cross-rank barrier turns "every rank published" into a global
+    // condition, which a local SyncAll cannot express because the flags travel
+    // from other cores on their own queues.
+    aclshmemx_mte_quiet();
+    aclshmemx_barrier_all_vec();
     PublishSourceDupPayloadDoneFlags(
         config,
         shmem_base,
@@ -2944,6 +2951,10 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void planning_ker
             local_shmem_gm,
             dup_payload_done_flag_off);
         AscendC::SyncAll<true>();
+        // The payload sits in this rank's scratch, which was read here on the
+        // previous launch. Drop those cached lines before materializing so a
+        // hit cannot return the previous round's bytes.
+        aclshmemx_mte_quiet();
 
         MaterializeSourceDupOutputs(
             source_dup_config,
@@ -2955,6 +2966,11 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void planning_ker
             dup_loffs_gm,
             dup_groups_scratch_off,
             dup_loffs_scratch_off);
+        // Every rank finished reading this round's payload and flags. Hold the
+        // peers here so the next planning launch cannot overwrite scratch or
+        // mailbox ranges that a slower rank is still materializing.
+        aclshmemx_mte_quiet();
+        aclshmemx_barrier_all_vec();
     }
 
 }

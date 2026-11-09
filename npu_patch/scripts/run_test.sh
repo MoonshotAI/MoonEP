@@ -226,6 +226,8 @@ else
         python test_npu/mte/test_moonep_dispatch_with_plan.py --mode kernel --R "$RANK_N" --S 64 --K 8 --H 128 --max-checks 8
     run_cmd "test_dispatch_combine_joint" \
         python test_npu/mte/test_dispatch_combine_joint.py --R "$RANK_N" --S 16 --K 4 --H 128
+    run_cmd "pytest test_npu/mte/test_dispatch_copy_combine.py (NPROC=$NPROC)" \
+        torchrun --nproc-per-node="$NPROC" -m pytest -s test_npu/mte/test_dispatch_copy_combine.py
     run_cmd "pytest test_npu/mte/test_e2e.py (NPROC=$NPROC)" \
         torchrun --nproc-per-node="$NPROC" -m pytest -s test_npu/mte/test_e2e.py
 fi

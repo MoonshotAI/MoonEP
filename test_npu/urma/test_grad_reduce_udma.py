@@ -98,6 +98,19 @@ def _plan_balanced_fan_in(R, B, epn, dev, seed=0):
     return plan.to(dev)
 
 
+def _plan_single_expert_fan_in(R, B, epn, dev, seed=0):
+    """Every source rank contributes only its slot 0, all to rank 0's expert 0.
+
+    Reproduces the reported multi-remote-source failure: with num_sms=32 the
+    owner rank issues one UDMA GET per remote source from a different AIV, so
+    several AIVs drive the shared UDMA queues concurrently.
+    """
+    plan = torch.full((R, B), -1, dtype=torch.int32)
+    for src in range(1, R):
+        plan[src, 0] = 0
+    return plan.to(dev)
+
+
 def _plan_asymmetric(R, B, epn, dev, seed=0):
     plan = torch.full((R, B), -1, dtype=torch.int32)
     for src in range(R):
@@ -124,6 +137,7 @@ PLAN_BUILDERS = {
     "empty": _plan_empty,
     "fan_in": _plan_fan_in,
     "balanced_fan_in": _plan_balanced_fan_in,
+    "single_expert_fan_in": _plan_single_expert_fan_in,
     "asymmetric": _plan_asymmetric,
     "random": _plan_random,
 }
@@ -249,6 +263,12 @@ CASES = [
      "Hp": 3072, "base_B": 4, "num_sms": 32},
     {"name": "fan_in_gt_stages", "epn": 4, "H": 256, "Hp": 128,
      "base_B": 16, "num_sms": 8, "plan": "fan_in"},
+    # Regression for the 507035/errcode-286 UDMA trap: 32 workers, every
+    # remote source converged on rank 0's expert 0. Before the fix the final
+    # aclshmem_quiet() made all 32 AIVs drain the shared UDMA queues
+    # concurrently. Shape mirrors the EP4/B8/H=512/Hp=512 repro.
+    {"name": "single_expert_fan_in_32sms", "epn": 8, "H": 512, "Hp": 512,
+     "base_B": 8, "num_sms": 32, "plan": "single_expert_fan_in"},
     {"name": "balanced_fan_in", "epn": 4, "H": 256, "Hp": 128,
      "base_B": 8, "num_sms": 8, "plan": "balanced_fan_in"},
     {"name": "empty_plan", "epn": 4, "H": 128, "Hp": 128,

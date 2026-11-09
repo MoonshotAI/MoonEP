@@ -633,8 +633,11 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void moonep_dispa
         with_weights != 0,
         core_idx, kMoonEPAivNum);
 
-    // Completes the scatter RMA updates and synchronizes all vector cores on
-    // every rank before the local duplicate expansion reads the receive buffer.
+    // The scatter above issues aclshmemx_mte_put_nbi, and sync_vec (behind
+    // aclshmemx_barrier_all_vec) does not complete outstanding NBI communication.
+    // Drain the puts before the barrier, the duplicate expansion, and the
+    // host-side independent-output copy read the receive buffer.
+    aclshmemx_mte_quiet();
     aclshmemx_barrier_all_vec();
 
     __gm__ bf16_t* hbuf = reinterpret_cast<__gm__ bf16_t*>(hidden_buf_gm);

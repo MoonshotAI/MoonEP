@@ -55,6 +55,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void prefetch_wei
     if ASCEND_IS_AIC {
         return;
     }
+    aclshmemx_sync_vec_all();
     __gm__ bfloat16_t* remote_expert_ptr =
         reinterpret_cast<__gm__ bfloat16_t*>(remote_expert_addr);
     __gm__ bfloat16_t* prefetch_ptr =

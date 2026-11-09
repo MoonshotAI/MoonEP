@@ -195,6 +195,11 @@ function(ascend_moonep_add_kernel_library TARGET)
             "${ASCEND_CANN_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc"
             "${ASCEND_CANN_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc/profiling"
             "${ASCEND_CANN_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc/runtime"
+            # CANN 9.2.0 nests the Bisheng runtime headers one level deeper
+            # (<arch>-linux/pkg_inc/runtime/runtime/rt.h).  Keep the
+            # architecture-generic form so one tree configures on aarch64 and
+            # x86_64 hosts alike.
+            "${ASCEND_CANN_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc/runtime/runtime"
             "${ASCEND_CANN_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/runtime/include"
             "${ASCEND_CANN_ROOT}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/runtime"
             "${ASCEND_CANN_ROOT}/compiler/tikcpp"

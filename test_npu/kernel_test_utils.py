@@ -144,6 +144,9 @@ def init_shmem(group=None, enable_udma=None, qp_count=0, ip_port=None, args=None
     if ShmemRuntime.is_initialized():
         return
     descriptors = symmetric_descriptors()
+    if dist.is_initialized():
+        group = dist.group.WORLD
+        dist.barrier(group=group)
     if _should_use_ip_port_bootstrap(ip_port=ip_port, args=args):
         if ip_port is None:
             ip_port = shmem_ip_port(ip_port=None, args=args)

@@ -362,8 +362,8 @@ class MoonEPRunner:
                             num_sms=self.num_sms, **barrier_args)
 
     def prefetch(self):
-        # launch_prefetch has no cross-rank sync of its own; pair it with a
-        # small sync so timed iterations stay serialized across ranks.
+        # launch_prefetch carries its own cross-rank pre/post barriers inside
+        # the kernel; the launch is stream-ordered and host-async.
         self._prefetch()
 
     def _prefetch_async_start(self):
