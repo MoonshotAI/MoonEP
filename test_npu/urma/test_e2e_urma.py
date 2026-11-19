@@ -37,12 +37,16 @@ References:
 
 Run with:
     torchrun --nproc_per_node=8 -m pytest -s test_npu/urma/test_e2e_urma.py
+
+Shape IDs are default (S4096/H256/K16/E64/Hp512) and dsv4
+(S4096/H7168/K6/E48/Hp3072, EP8). Select one with -k default or -k dsv4.
 """
 
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -310,20 +314,20 @@ def assert_raises_assertion(expected_substr, fn):
         raise AssertionError(f"expected AssertionError containing {expected_substr!r}")
 
 
-def test_e2e_urma():
+@pytest.mark.parametrize("S,H,K,E,Hp,ep_size", [
+    pytest.param(4096, 256, 16, 64, 512, None, id="default"),
+    pytest.param(4096, 7168, 6, 48, 3072, 8, id="dsv4"),
+])
+def test_e2e_urma(S, H, K, E, Hp, ep_size):
     """Full URMA operator-chain e2e: dispatch / prefetch / combine / reduce_grad."""
     enable_urma_env()
     rank, R = setup()
-    # S=128/H=64 mirrors test_npu/buffer_test/test_buffer_plan.py's default config, which is
-    # stable on this hardware; larger S/H intermittently trigger a MaskedSelectV3
-    # OOB (507035) in the planning kernel (see docs/planning_operator_test_notes.md).
-    S, H, K, E = 4096, 256, 16, 64
+    if ep_size is not None and R != ep_size:
+        pytest.skip(f"this shape requires {ep_size} EP ranks, got {R}")
     # The Ascend planning kernel requires num_prefetch_slots == E / R.
     B = E // R
     epn = E // R
-    # Hp=512 makes epn*row = 8*256*512*2 = 2 MiB, an exact multiple of the VMM granularity,
-    # so the full_weight projection can place the home segment exactly at [rank*epn, (rank+1)*epn).
-    Hp = 512
+    # Both eight-rank shapes have 2 MiB-aligned BF16 local home segments.
     num_sms = 32
     device = local_device_index()
     dev = f"npu:{device}"
@@ -582,4 +586,4 @@ def setup():
 
 
 if __name__ == "__main__":
-    test_e2e_urma()
+    test_e2e_urma(4096, 256, 16, 64, 512, None)

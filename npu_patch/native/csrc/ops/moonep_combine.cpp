@@ -44,8 +44,12 @@ void MoonEPCombine(
     int64_t K,
     int64_t R,
     int64_t rank,
-    bool use_udma) {
+    bool use_udma,
+    int64_t num_sms) {
     (void)use_udma;
+    TORCH_CHECK(num_sms > 0 &&
+                    static_cast<uint64_t>(num_sms) <= std::numeric_limits<uint32_t>::max(),
+                "num_sms must be a positive uint32 launch width");
     CheckNpuContiguous(hidden_buf, "hidden_buf");
     CheckNpuContiguous(dst, "dst");
     CheckNpuContiguous(dup_groups, "dup_groups");
@@ -137,7 +141,7 @@ void MoonEPCombine(
     tiling.num_tokens = static_cast<uint32_t>(S);
     tiling.hidden = static_cast<uint32_t>(H);
     tiling.num_topk = static_cast<uint32_t>(K);
-    tiling.block_dim = 32u;
+    tiling.block_dim = static_cast<uint32_t>(num_sms);
     tiling.with_weight = with_weight ? 1u : 0u;
     tiling.reserved = 0u;
 

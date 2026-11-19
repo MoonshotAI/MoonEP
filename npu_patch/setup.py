@@ -139,6 +139,7 @@ def _npu_extension():
     sources = [
         os.path.join("native", "csrc", "pybind.cpp"),
         os.path.join("native", "csrc", "acl_shared_buffer.cpp"),
+        os.path.join("native", "csrc", "barrier.cpp"),
         os.path.join("native", "csrc", "torch_classes.cpp"),
         os.path.join("native", "csrc", "launcher.cpp"),
         os.path.join("native", "csrc", "ops", "moonep_combine.cpp"),

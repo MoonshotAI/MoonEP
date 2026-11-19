@@ -9,10 +9,12 @@ keep the ported Ascend tests minimal: they resolve the op object from
 ``launch_dispatch_epilogue`` / ``launch_combine_prologue`` steps are folded into
 ``launch_dispatch`` / ``launch_combine`` and no longer have their own shims.
 
-Two launchers are intentionally *not* shimmed through a Buffer ctx because the
+These launchers are intentionally *not* shimmed through a Buffer ctx because the
 standalone stage tests call them without one:
   - ``launch_prefetch(remote_expert, prefetch_buffers, experts_to_copy, num_sms)``
+  - ``launch_prefetch_from_ptrs(source_ptrs, prefetch_buffers, plan, local_experts, ...)``
   - ``launch_grad_reduce(remote_expert_grads, reduce_buffers, plan, rank, ...)``
+  - ``launch_grad_reduce_targets(target_ptrs, reduce_buffers, plan, rank, num_sms)``
 Their Ascend contracts are described in ``ops.py``.
 """
 
@@ -126,11 +128,14 @@ def launch_dispatch_op(
     num_topk: int,
     world_size: int,
     rank: int,
+    num_sms: int = 32,
 ) -> None:
+    """Launch dispatch; num_sms controls only the MTE AIV launch width."""
     global _DISPATCH
     if _DISPATCH is None:
         _DISPATCH = torch.classes.AscendMoonEP.Dispatch()
-    _DISPATCH.compute(
+    use_udma = _env_use_udma('dispatch')
+    args = (
         hidden_sh,
         route_weights,
         dst,
@@ -145,8 +150,11 @@ def launch_dispatch_op(
         num_topk,
         world_size,
         rank,
-        _env_use_udma('dispatch'),
+        use_udma,
     )
+    if not use_udma:
+        args += (num_sms,)
+    _DISPATCH.compute(*args)
 
 
 def launch_dispatch_profile_op(
@@ -204,8 +212,9 @@ def launch_combine_op(
     num_topk: int,
     world_size: int,
     rank: int,
+    num_sms: int = 32,
 ) -> None:
-    """Select native/UDMA combine from the process environment."""
+    """Select native/UDMA combine; num_sms controls the MTE launch width."""
     global _COMBINE, _COMBINE_UDMA
     if _env_use_udma("combine"):
         if _COMBINE_UDMA is None:
@@ -254,6 +263,7 @@ def launch_combine_op(
         world_size,
         rank,
         False,
+        num_sms,
     )
 
     if route_weights_sk_out is not None and sk_stride != num_topk:
@@ -351,6 +361,18 @@ def launch_prefetch(
         num_experts, num_sms, 0, _env_use_udma('prefetch'))
 
 
+def launch_prefetch_from_ptrs(source_ptrs, prefetch_buffers, experts_to_copy,
+                              local_experts):
+    """Submit prepared weight pointers through the PrefetchWeight custom class."""
+    use_udma = _env_use_udma('prefetch')
+    global _PREFETCH_WEIGHT
+    if _PREFETCH_WEIGHT is None:
+        _PREFETCH_WEIGHT = torch.classes.AscendMoonEP.PrefetchWeight(0)
+    return _PREFETCH_WEIGHT.compute_from_ptrs(
+        source_ptrs, prefetch_buffers, experts_to_copy,
+        local_experts, use_udma)
+
+
 def launch_grad_reduce(
     remote_expert_grads: torch.Tensor,
     remote_reduce_buffers: torch.Tensor,
@@ -416,3 +438,59 @@ def launch_grad_reduce(
         min(num_sms, 64),
         _env_use_udma('grad_reduce'),
     )
+
+
+def launch_grad_reduce_targets(
+    target_ptrs: torch.Tensor,
+    reduce_buffers: torch.Tensor,
+    experts_to_copy: torch.Tensor,
+    rank: int,
+    num_sms: int,
+    udma_workspace: torch.Tensor | None = None,
+) -> None:
+    """Explicit canonical-pointer contract, distinct from the dense entry.
+
+    ``target_ptrs`` is a setup-frozen contiguous INT64 [epn] table of local
+    FP32 matrix addresses. Each target is contiguous [H, H']; targets remain
+    alive, disjoint and address-stable until completion. They need not be
+    symmetric or adjacent. Only ``reduce_buffers[B,H,H']`` is a symmetric
+    source bank. The launcher reads the grad_reduce environment flag for
+    both Buffer and standalone calls. UDMA needs
+    setup-owned local FP32 scratch of at least
+    512*1024*max(2*min(num_sms,64),R*B) elements through completion.
+    The native entry validates the scratch metadata and capacity.
+    MTE uses ordered addition; UDMA retains dense UDMA's atomic-add ordering.
+    Both fuse reduction, an AIV WORLD barrier and valid-slot clearing.
+    Callers must establish cross-rank input readiness before submission.
+    Completion covers local targets and local slot clearing, as in dense.
+    """
+    if reduce_buffers.numel() == 0 or experts_to_copy.numel() == 0:
+        return
+
+    assert target_ptrs.dtype == torch.int64
+    assert target_ptrs.is_contiguous() and target_ptrs.ndim == 1
+    assert reduce_buffers.dtype == torch.float32
+    assert reduce_buffers.is_contiguous() and reduce_buffers.ndim == 3
+    assert experts_to_copy.dtype == torch.int32
+    assert experts_to_copy.is_contiguous() and experts_to_copy.ndim == 2
+    assert isinstance(rank, int)
+    assert isinstance(num_sms, int) and num_sms > 0
+    epn = int(target_ptrs.numel())
+    B, H, Hp = (int(value) for value in reduce_buffers.shape)
+    R, plan_B = (int(value) for value in experts_to_copy.shape)
+    assert plan_B == B
+    assert 0 <= rank < R
+    device = target_ptrs.device
+    assert device.type == "npu"
+    assert reduce_buffers.device == device
+    assert experts_to_copy.device == device
+
+    use_udma = _env_use_udma('grad_reduce')
+    blocks = min(num_sms, 64)
+    global _GRAD_REDUCE
+    if _GRAD_REDUCE is None:
+        _GRAD_REDUCE = torch.classes.AscendMoonEP.GradReduce()
+    _GRAD_REDUCE.compute_targets(
+        target_ptrs, reduce_buffers, experts_to_copy,
+        epn, H, Hp, R, B, rank, blocks, use_udma,
+        udma_workspace if use_udma else None)

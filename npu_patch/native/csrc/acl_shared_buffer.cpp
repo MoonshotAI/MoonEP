@@ -1,4 +1,5 @@
 #include "acl_shared_buffer.h"
+#include "barrier.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,7 @@
 
 #include "acl/acl.h"
 #include "shmem.h"
+#include "ascend_moonep/kernels/launch.h"
 
 namespace ascend_moonep {
 
@@ -700,8 +702,7 @@ int acl_shmem_init_with_buffers_ip_port(
 }
 
 void acl_shmem_barrier_all_on_stream(int64_t stream) {
-    aclshmemx_barrier_all_on_stream(
-        reinterpret_cast<aclrtStream>(static_cast<uintptr_t>(stream)));
+    BarrierAllOnStream(reinterpret_cast<aclrtStream>(static_cast<uintptr_t>(stream)));
 }
 
 }

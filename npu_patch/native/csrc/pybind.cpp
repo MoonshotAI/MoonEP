@@ -12,7 +12,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::int_(sizeof(aclshmemx_buffer_optional_attr_t));
 
     using py::arg;
-
     m.def("launch_device_barrier_bench", &LaunchDeviceBarrierBench,
           arg("iterations"), arg("block_dim") = 32,
           "Launch a device kernel containing only repeated "

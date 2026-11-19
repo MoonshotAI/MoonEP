@@ -21,7 +21,7 @@ struct alignas(8) MoonEPCombineTilingData {
     uint32_t num_tokens;        // S
     uint32_t hidden;            // H
     uint32_t num_topk;          // K
-    uint32_t block_dim;         // fixed 32 AIV (host always writes 32)
+    uint32_t block_dim;         // MTE AIV launch width from num_sms
     uint32_t with_weight;       // 1: gather weights → [S,K]; 0: skip
     uint32_t reserved;
 };
@@ -44,7 +44,11 @@ struct alignas(8) MoonEPDispatchTilingData {
     uint32_t rank;
     uint32_t with_weights;
     uint32_t reserved;
+    uint32_t block_dim;         // MTE only; occupies the former tail padding
 };
+
+static_assert(sizeof(MoonEPDispatchTilingData) == 32, "dispatch tiling ABI must remain 32 bytes");
+static_assert(sizeof(MoonEPCombineTilingData) == 32, "combine tiling ABI must remain 32 bytes");
 
 // Udma dispatch profile ABI (mirrors the UBMEM template-<bool Profile> pattern
 // from the timing branch): moonep_dispatch_udma_profile_kernel writes each AIV's

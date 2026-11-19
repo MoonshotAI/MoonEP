@@ -7,7 +7,7 @@ namespace ascend_moonep::ops {
 // Plan-driven moonEP_combine on already-symmetric SHMEM shards.
 // Outputs are caller-allocated. Host ABI mirrors MoonEPDispatch.
 // Provide weight_buf and route_weights_sk_out together, or omit both.
-// Launch width is fixed at 32 AIV.
+// MTE launch width is controlled by num_sms.
 //
 // route_weights_sk_out must be fp32 [S, AlignUp(K, 8)] when present
 // (kernel DataCopy width).
@@ -25,6 +25,7 @@ void MoonEPCombine(
     int64_t K,
     int64_t R,
     int64_t rank,
-    bool use_udma);
+    bool use_udma,
+    int64_t num_sms = 32);
 
 }  // namespace ascend_moonep::ops

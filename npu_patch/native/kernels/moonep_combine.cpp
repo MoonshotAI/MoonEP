@@ -36,7 +36,6 @@
 using namespace AscendC;
 using half_t = __fp16;
 using bf16_t = bfloat16_t;
-using ascend_moonep::kMoonEPAivNum;
 using ascend_moonep::MoonEPCombineTilingData;
 
 namespace {
@@ -1044,7 +1043,7 @@ extern "C" ASCEND_MOONEP_EXPORT void moonep_combine_kernel_do(
     uint8_t* tiling_host)
 {
     auto* td = reinterpret_cast<MoonEPCombineTilingData*>(tiling_host);
-    moonep_combine_kernel<<<kMoonEPAivNum, nullptr, stream>>>(
+    moonep_combine_kernel<<<td->block_dim, nullptr, stream>>>(
         hidden_buf,
         weight_buf,
         dst,

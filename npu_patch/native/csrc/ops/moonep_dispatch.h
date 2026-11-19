@@ -22,7 +22,8 @@ MoonEPDispatch(
     int64_t K,
     int64_t R,
     int64_t rank,
-    bool use_udma);
+    bool use_udma,
+    int64_t num_sms = 32);
 
 void
 MoonEPDispatchProfile(

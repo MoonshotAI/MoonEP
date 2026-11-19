@@ -12,4 +12,8 @@ torch::Tensor LaunchPrefetch(
     int64_t instance_id,
     bool use_udma);
 
+
+// Stateless submissions: caller owns Tensor/table lifetime and consumer final use.
+torch::Tensor LaunchPrefetchPushPointers(torch::Tensor pointers, torch::Tensor slots,
+    torch::Tensor plan, int64_t local_experts, bool use_udma);
 }  // namespace ascend_moonep::ops

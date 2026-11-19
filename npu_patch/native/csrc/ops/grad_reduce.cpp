@@ -1,11 +1,13 @@
 #include "csrc/ops/grad_reduce.h"
 
+#include <algorithm>
 #include <limits>
 
 #include <torch/extension.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
 #include "ascend_moonep/kernels/launch.h"
+#include "shmem.h"
 
 namespace ascend_moonep::ops {
 
@@ -82,9 +84,6 @@ void GradReduce(
     int64_t rank,
     int64_t blocks,
     bool use_udma) {
-    // The current grad-reduce implementation has no separate UDMA kernel.
-    // Keep the unified ABI and deliberately use the existing SHMEM path.
-    (void)use_udma;
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
     CheckNpuContiguous(expert_grads, "expert_grads");
@@ -148,6 +147,90 @@ void GradReduce(
             static_cast<int32_t>(rank),
             static_cast<int32_t>(blocks));
         TORCH_CHECK(ret == 0, "grad_reduce kernel failed with ACL error: ", ret);
+    }
+}
+
+void GradReduceTargets(
+    torch::Tensor target_ptrs,
+    torch::Tensor reduce_buffers,
+    torch::Tensor experts_to_copy,
+    int64_t epn,
+    int64_t hidden,
+    int64_t projection,
+    int64_t ranks,
+    int64_t slots,
+    int64_t rank,
+    int64_t blocks,
+    bool use_udma,
+    torch::Tensor udma_workspace) {
+#if !defined(ASCEND_MOONEP_UDMA)
+    TORCH_CHECK(!use_udma,
+        "canonical grad_reduce UDMA kernel support is not enabled in this build");
+#endif
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    CheckNpuContiguous(target_ptrs, "target_ptrs");
+    TORCH_CHECK(
+        target_ptrs.scalar_type() == torch::kInt64 &&
+            target_ptrs.dim() == 1 && target_ptrs.numel() == epn,
+        "canonical target pointers must be contiguous INT64 [epn]");
+    TORCH_CHECK(
+        target_ptrs.device() == reduce_buffers.device(),
+        "target_ptrs and reduce_buffers must be on the same device");
+    CheckCommon(reduce_buffers, experts_to_copy, hidden, projection,
+                ranks, slots, rank, blocks);
+    TORCH_CHECK(epn > 0, "epn must be positive");
+    CheckInt32(epn, "epn");
+
+    if (use_udma) {
+        TORCH_CHECK(udma_workspace.defined(), "UDMA grad_reduce requires setup-owned workspace");
+        CheckNpuContiguous(udma_workspace, "udma_workspace");
+        TORCH_CHECK(udma_workspace.scalar_type() == torch::kFloat32 &&
+                        udma_workspace.device() == reduce_buffers.device() &&
+                        ranks <= std::numeric_limits<int64_t>::max() / std::max<int64_t>(slots, 1),
+                    "udma_workspace device/dtype or rank-slot product is invalid");
+        const int64_t regions = std::max<int64_t>(blocks * 2, ranks * slots);
+        constexpr int64_t tile = 512 * 1024;
+        TORCH_CHECK(regions <= std::numeric_limits<int64_t>::max() / (tile * sizeof(float)),
+                    "ordered UDMA workspace byte count exceeds int64");
+        TORCH_CHECK(udma_workspace.numel() >= tile * regions,
+                    "udma_workspace must be local FP32 scratch with at least "
+                    "512*1024*max(blocks*2,ranks*slots) elements on the source device");
+    }
+
+    // The caller publishes all ranks' input slots before this launch.
+    // Completion, the AIV WORLD barrier and slot clear are fused, as in dense.
+    // UDMA scratch remains caller-owned and is allocated during setup.
+    if (use_udma) {
+#if defined(ASCEND_MOONEP_UDMA)
+        const int ret = moonep_shmem_grad_reduce_targets_udma(
+            stream,
+            target_ptrs.data_ptr(),
+            reduce_buffers.data_ptr(),
+            udma_workspace.data_ptr(),
+            experts_to_copy.data_ptr<int32_t>(),
+            static_cast<int32_t>(epn),
+            static_cast<int32_t>(hidden),
+            static_cast<int32_t>(projection),
+            static_cast<int32_t>(ranks),
+            static_cast<int32_t>(slots),
+            static_cast<int32_t>(rank),
+            static_cast<int32_t>(blocks));
+        TORCH_CHECK(ret == 0, "canonical grad_reduce kernel failed with ACL error: ", ret);
+#endif
+    } else {
+        const int ret = moonep_shmem_grad_reduce_targets(
+            stream,
+            target_ptrs.data_ptr(),
+            reduce_buffers.data_ptr(),
+            experts_to_copy.data_ptr<int32_t>(),
+            static_cast<int32_t>(epn),
+            static_cast<int32_t>(hidden),
+            static_cast<int32_t>(projection),
+            static_cast<int32_t>(ranks),
+            static_cast<int32_t>(slots),
+            static_cast<int32_t>(rank),
+            static_cast<int32_t>(blocks));
+        TORCH_CHECK(ret == 0, "canonical grad_reduce kernel failed with ACL error: ", ret);
     }
 }
 

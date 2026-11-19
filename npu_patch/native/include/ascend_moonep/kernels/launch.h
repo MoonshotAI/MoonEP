@@ -10,6 +10,8 @@
 
 extern "C" {
 
+// Experimental native GR barrier; public tensor/SPI ABI remains unchanged.
+
 ASCEND_MOONEP_EXPORT void device_barrier_bench_kernel_do(
     void* stream,
     int32_t iterations,
@@ -120,6 +122,19 @@ ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce(
     int32_t rank,
     int32_t blocks);
 
+// Local canonical target pointer table; source slots remain symmetric.
+ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce_targets(
+    void* stream, void* target_ptrs, void* reduce_buffers,
+    const int32_t* experts_to_copy, int32_t epn, int32_t hidden,
+    int32_t projection, int32_t ranks, int32_t slots, int32_t rank,
+    int32_t blocks);
+
+ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce_targets_udma(
+    void* stream, void* target_ptrs, void* reduce_buffers, void* workspace,
+    const int32_t* experts_to_copy, int32_t epn, int32_t hidden,
+    int32_t projection, int32_t ranks, int32_t slots, int32_t rank,
+    int32_t blocks);
+
 ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce_udma(
     void* stream,
     void* expert_grads,
@@ -155,5 +170,25 @@ ASCEND_MOONEP_EXPORT void prefetch_weight_kernel_udma_do(
     int64_t hidden_prime,
     int64_t num_slots,
     int64_t block_dim);
+
+ASCEND_MOONEP_EXPORT int moonep_prefetch_pointer_push_mte(
+    void* stream,
+    const uint64_t* source_ptrs,
+    void* weight_slots,
+    const int32_t* experts_to_copy,
+    int64_t row_elements,
+    int32_t local_experts,
+    int32_t ranks,
+    int32_t slots,
+    int32_t rank,
+    int32_t blocks);
+
+
+
+ASCEND_MOONEP_EXPORT int prefetch_pointer_push_udma_available();
+ASCEND_MOONEP_EXPORT int aclshmemx_barrier_all_on_stream_aiv(void* stream);
+ASCEND_MOONEP_EXPORT int moonep_prefetch_pointer_push_udma(
+    void* stream, uint8_t* pointers, uint8_t* slots, uint8_t* plan,
+    int64_t experts, int64_t row_elements, int64_t num_slots);
 
 }  // extern "C"

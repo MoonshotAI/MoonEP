@@ -299,7 +299,8 @@ void MoonEPShmemGradReduceFused(
     int32_t projection,
     int32_t ranks,
     int32_t slots,
-    int32_t rank)
+    int32_t rank,
+    bool pointer_targets)
 {
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
@@ -307,6 +308,7 @@ void MoonEPShmemGradReduceFused(
     }
 
     auto* grads = reinterpret_cast<__gm__ float*>(expert_grads_addr);
+    auto* target_ptrs = reinterpret_cast<__gm__ uint64_t*>(expert_grads_addr);
     auto* reduce = reinterpret_cast<__gm__ float*>(reduce_buffers_addr);
     auto* plan = reinterpret_cast<__gm__ int32_t*>(experts_to_copy_addr);
     const int32_t local_begin = rank * epn;
@@ -324,19 +326,26 @@ void MoonEPShmemGradReduceFused(
 
     for (int32_t local_expert = 0; local_expert < epn; ++local_expert) {
         const int32_t global_expert = local_begin + local_expert;
+        // Adapt pointer targets to the existing dense accumulation contract:
+        // one expert allocation is a one-row dense view, addressed at row 0.
+        // Keep global_expert unchanged for matching contributions in the plan.
+        auto* accum_grads = pointer_targets ?
+            reinterpret_cast<__gm__ float*>(target_ptrs[local_expert]) :
+            grads;
+        const int32_t accum_local_expert = pointer_targets ? 0 : local_expert;
         for (int64_t tile = block; tile < tiles_per_expert; tile += block_count) {
             const int64_t tile_begin = tile * kTileElements;
             const int32_t elements = static_cast<int32_t>(
                 matrix - tile_begin < kTileElements ?
                     matrix - tile_begin : kTileElements);
             AccumulatePlanTile(
-                grads,
+                accum_grads,
                 reduce,
                 plan,
                 accum_ub,
                 reduce_ping_ub,
                 reduce_pong_ub,
-                local_expert,
+                accum_local_expert,
                 global_expert,
                 matrix,
                 tile_begin,
@@ -347,27 +356,14 @@ void MoonEPShmemGradReduceFused(
         }
     }
 
-    // Every AIV on every rank must reach this collective. Do not add an AIV
-    // early return above it, including for empty plans or blocks with no work.
     aclshmem_quiet();
-    // This kernel is [[core_ratio(0, 1)]] and launches AIV workers only.
-    // The installed CANN-SHMEM generic barrier also includes non-vector
-    // participants and deadlocks for this launch shape; use its vector-only
-    // device collective so the participant set matches the kernel grid.
+    // All workers participate, including workers with no reduction tasks.
     aclshmemx_barrier_all_vec();
-
-    ClearLocalSlots(
-        reduce,
-        plan,
-        accum_ub,
-        matrix,
-        slots,
-        rank,
-        block,
-        block_count);
+    ClearLocalSlots(reduce, plan, accum_ub, matrix, slots, rank,
+                    block, block_count);
 }
 
-extern "C" ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce(
+static int LaunchGradReduce(
     void* stream,
     void* expert_grads,
     void* reduce_buffers,
@@ -378,7 +374,8 @@ extern "C" ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce(
     int32_t ranks,
     int32_t slots,
     int32_t rank,
-    int32_t blocks)
+    int32_t blocks,
+    bool pointer_targets)
 {
     if (stream == nullptr || expert_grads == nullptr ||
         reduce_buffers == nullptr || experts_to_copy == nullptr ||
@@ -404,6 +401,27 @@ extern "C" ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce(
         projection,
         ranks,
         slots,
-        rank);
+        rank,
+        pointer_targets);
     return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
+}
+
+extern "C" ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce(
+    void* stream, void* expert_grads, void* reduce_buffers,
+    const int32_t* experts_to_copy, int32_t epn, int32_t hidden,
+    int32_t projection, int32_t ranks, int32_t slots, int32_t rank,
+    int32_t blocks)
+{
+    return LaunchGradReduce(stream, expert_grads, reduce_buffers, experts_to_copy,
+        epn, hidden, projection, ranks, slots, rank, blocks, false);
+}
+
+extern "C" ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce_targets(
+    void* stream, void* target_ptrs, void* reduce_buffers,
+    const int32_t* experts_to_copy, int32_t epn, int32_t hidden,
+    int32_t projection, int32_t ranks, int32_t slots, int32_t rank,
+    int32_t blocks)
+{
+    return LaunchGradReduce(stream, target_ptrs, reduce_buffers, experts_to_copy,
+        epn, hidden, projection, ranks, slots, rank, blocks, true);
 }

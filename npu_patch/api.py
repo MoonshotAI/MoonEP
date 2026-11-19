@@ -16,9 +16,10 @@ from collections.abc import Sequence
 import torch
 import torch_npu
 import torch.distributed as dist
-
 # Plan B: the C-interface path no longer depends on the shmem Python package.
 # import shmem.core as core
+
+from . import _C
 
 from ._common import (
     BARRIER_SLOTS,
@@ -44,6 +45,10 @@ from .ops import (
 )
 from .launchers import planning_workspace_sizes
 from .shmem_runtime import ShmemRuntime
+from .buffer_bindings import (
+    CommBuffers, ExpertPointerBinding, comm_context, overlaps, symmetric_source,
+    tensor_signature, validate_unchanged,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +100,16 @@ def _op_ws_bytes_from_env(default: int = OP_WS_BYTES_DEFAULT) -> int:
     if raw is None or raw == "":
         return default
     return int(raw)
+
+
+def _validate_plan_layout(ctx: dict, plan: MoonEPCommPlan) -> None:
+    """Require a saved plan to match the Buffer's fixed token layout."""
+    if not isinstance(plan, MoonEPCommPlan):
+        raise TypeError("expected a MoonEPCommPlan")
+    identity = (plan.N, plan.R, plan.E, plan.B, plan.NvS, plan.K)
+    expected = tuple(int(ctx[name]) for name in ('N', 'R', 'E', 'B', 'NvS', 'K'))
+    if tuple(int(value) for value in identity) != expected:
+        raise RuntimeError("plan belongs to another Buffer layout")
 
 
 def _log_context_buffer_size(ctx: dict) -> None:
@@ -352,6 +367,33 @@ def _create_context(
     return ctx
 
 
+_BARRIER_MODE = None
+
+
+def _extend_context(ctx: dict, *, barrier_mode: str | None = None) -> dict:
+    """Configure one process-wide barrier policy before SHMEM initialization.
+
+    Layouts and workspaces remain owned by the original _create_context.
+    All Buffers/ranks must use the same mode; never change the environment
+    while operations are in flight. The policy is independent of use_udma.
+    """
+    from . import buffer_c
+    global _BARRIER_MODE
+    if (ShmemRuntime.is_initialized() or getattr(ShmemRuntime, '_poisoned', False)
+            or buffer_c._SHMEM_BACKING_LOCKED):
+        raise RuntimeError('extend context before SHMEM initialization and backing lock')
+    mode = (os.environ.get('ASCEND_MOONEP_BARRIER_MODE', 'mixed')
+            if barrier_mode is None else barrier_mode)
+    if mode not in ('mixed', 'aiv'):
+        raise ValueError('barrier_mode must be mixed or aiv')
+    if _BARRIER_MODE is not None and mode != _BARRIER_MODE:
+        raise RuntimeError('all Buffers in a process must use the same barrier_mode')
+    os.environ['ASCEND_MOONEP_BARRIER_MODE'] = mode
+    _BARRIER_MODE = mode
+    ctx['barrier_mode'] = mode
+    return ctx
+
+
 class Buffer:
     """Ascend MoonEP communication buffer owner (buffer-backed path only).
 
@@ -402,6 +444,7 @@ class Buffer:
         # _ensure_shmem_views.
         allowed_udma = {'planning', 'dispatch', 'combine', 'prefetch', 'grad_reduce'}
         use_udma = kwargs.pop('use_udma', False)
+        barrier_mode = kwargs.pop('barrier_mode', None)
         if not isinstance(use_udma, bool):
             raise TypeError('use_udma must be a bool')
         udma_flags = {}
@@ -426,6 +469,7 @@ class Buffer:
         self.explicitly_destroy = explicitly_destroy
         self.comm_stream_priority = comm_stream_priority
         self.enable_pdl = enable_pdl
+        self._comm_buffers: CommBuffers | None = None
         self._comm_stream: torch_npu.npu.Stream | None = None
         self._destroyed = False
         self._ctx = _create_context(
@@ -440,6 +484,10 @@ class Buffer:
         )
         # Buffer-backed: set True by _ensure_shmem_views after init_with_buffer.
         self._shmem_ready = False
+        _extend_context(
+            self._ctx,
+            barrier_mode=barrier_mode,
+        )
         self._comm_stream = torch_npu.npu.Stream(
             device=int(self._ctx['device']),
             priority=self.comm_stream_priority,
@@ -523,6 +571,14 @@ class Buffer:
             self._destroyed = True
             return
 
+        # Reject before touching any op while SHMEM still owns VMM backing,
+        # including when collective finalize failed.
+        from . import buffer_c
+        if buffer_c._SHMEM_BACKING_LOCKED:
+            raise RuntimeError(
+                'cannot release VMM descriptor backing before a successful '
+                'collective shmem finalize')
+
         # torch_npu.npu.synchronize() below already drains every stream on the
         # device, including the comm stream, so no separate comm-stream sync.
         torch_npu.npu.synchronize()
@@ -568,6 +624,8 @@ class Buffer:
         self._ctx = None
         self._comm_stream = None
         self._destroyed = True
+        self._comm_buffers = None
+        self.__dict__.get('_native_storage_bindings', []).clear()
 
     def __del__(self):
         if getattr(self, "_destroyed", True):
@@ -601,6 +659,156 @@ class Buffer:
             plan.dup_loffs,
             plan.dup_counts,
         )
+
+    @property
+    def comm_stream(self):
+        """The single ordered native communication stream (read-only binding)."""
+        self._require_ctx()
+        return self._comm_stream
+
+    def barrier_on_stream(self, stream):
+        """Enqueue the configured collective fence; caller owns its ordering."""
+        self._require_ctx()
+        if stream.device != self._comm_stream.device:
+            raise ValueError('barrier stream must share the Buffer device')
+        _C.acl_shmem_barrier_all_on_stream(stream.npu_stream)
+
+    def prepare_comm_buffers(self, hidden_source, route_source):
+        """Prepare caller-owned banks after SHMEM init, before hot calls.
+
+        Register the VMM backing for both sources before init_with_buffer.
+        This method only maps views; it does not allocate memory or choose capacity.
+        """
+        ctx = self._require_ctx()
+        nvs, hidden_size = int(ctx['NvS']), int(ctx['H'])
+        if (hidden_source.dtype != torch.bfloat16 or route_source.dtype != torch.int32 or
+                tuple(hidden_source.shape) != (nvs, hidden_size) or
+                tuple(route_source.shape) != (nvs,) or
+                hidden_source.device != ctx['hidden_buf_local'].device or
+                route_source.device != hidden_source.device or overlaps(hidden_source, route_source)):
+            raise ValueError('expected distinct capacity-sized BF16 hidden and INT32 route VMM sources')
+        hidden, route = symmetric_source(hidden_source), symmetric_source(route_source)
+        result = CommBuffers(hidden, route, (hidden_source, route_source))
+        self.__dict__.setdefault('_native_storage_bindings', []).append(result)
+        return result
+
+    def set_comm_buffers(self, comm_buffers: CommBuffers | None) -> None:
+        """Select prepared storage for subsequent Dispatch and Combine calls.
+
+        Selection does not wait for outstanding work or release the old bank.
+        Use one host submission thread; callers own cross-rank and reuse order.
+        None selects the Buffer's default storage.
+        """
+        self._require_ctx()
+        if comm_buffers is not None and not isinstance(comm_buffers, CommBuffers):
+            raise TypeError('comm_buffers must be CommBuffers or None')
+        self._comm_buffers = comm_buffers
+
+    def prepare_expert_binding(self, expert_tensors, comm_buffer_source) -> ExpertPointerBinding:
+        """Prepare expert addresses and one registered local communication buffer.
+
+        The communication buffer dtype selects BF16 expert weight sources or
+        FP32 canonical gradient destinations; expert tensors must match it.
+        All device pointer metadata/scratch is prepared
+        here, never on an execution-path cache miss. Addresses must stay fixed.
+        Prepare and submit from the same caller stream. Async submission makes
+        the communication stream wait for that caller stream.
+        """
+        ctx = self._require_ctx()
+        expert_tensors = tuple(expert_tensors)
+        ranks, slots = int(ctx['R']), int(ctx['B'])
+        local_experts = int(ctx['E']) // ranks
+        dtype = comm_buffer_source.dtype
+        if dtype not in (torch.bfloat16, torch.float32):
+            raise TypeError('expert communication buffer must be BF16 or FP32')
+        if (comm_buffer_source.ndim != 3 or comm_buffer_source.shape[0] != slots or
+                min(comm_buffer_source.shape[1:]) <= 0 or
+                comm_buffer_source.device != ctx['hidden_buf_local'].device):
+            raise ValueError('expert communication buffer must be local [B,M,N] on the Buffer device')
+        comm_buffer = symmetric_source(comm_buffer_source)
+        addresses, ranges = self._validate_expert_tensors(
+            expert_tensors, comm_buffer, dtype=dtype, operation='prepare expert pointers', expected_experts=local_experts)
+        slot_bytes = comm_buffer_source.numel() * comm_buffer_source.element_size()
+        if any(start < base + slot_bytes and base < end
+               for base in (comm_buffer_source.data_ptr(), comm_buffer.data_ptr()) for start, end in ranges):
+            raise ValueError('expert tensors must not alias their communication buffer')
+        if dtype == torch.float32:
+            ordered = sorted(ranges)
+            if any(a[1] > b[0] for a, b in zip(ordered, ordered[1:])):
+                raise ValueError('canonical gradient destinations must not overlap')
+            if slots != local_experts:
+                raise ValueError('gradient reduction requires one gradient slot per local expert')
+            use_udma = ctx.get('_grad_reduce_use_udma', False)
+            if use_udma and ctx.get('_grad_reduce_target_workspace') is None:
+                blocks = int(min(ctx['num_sms'], 64))
+                elements = 512 * 1024 * max(2 * blocks, ranks * slots)
+                ctx['_grad_reduce_target_workspace'] = torch.empty(
+                    elements, dtype=torch.float32, device=comm_buffer.device)
+        expert_views = tuple(ref.detach() for ref in expert_tensors)
+        expert_ptrs = torch.tensor(addresses, dtype=torch.int64, device=comm_buffer.device)
+        result = ExpertPointerBinding(expert_tensors, expert_views, comm_buffer, comm_buffer_source, expert_ptrs,
+            tuple(tensor_signature(ref) for ref in expert_tensors))
+        self.__dict__.setdefault('_native_storage_bindings', []).append(result)
+        return result
+
+    def _validate_pointer_binding(self, binding, plan, *, dtype):
+        ctx = self._require_ctx()
+        if not isinstance(binding, ExpertPointerBinding):
+            raise TypeError('expert pointer binding must be ExpertPointerBinding')
+        if not ShmemRuntime.is_initialized() or getattr(ShmemRuntime, '_poisoned', False):
+            raise RuntimeError('expert pointer execution requires initialized healthy SHMEM')
+        validate_unchanged(binding.expert_tensors, binding.tensor_signatures)
+        if binding.comm_buffer.dtype != dtype:
+            raise TypeError('expert pointer binding has the wrong projection dtype')
+        self._validate_expert_plan(plan, binding.comm_buffer, 'expert pointer communication')
+        return ctx
+
+    def prefetch_weight_from_ptrs(self, plan, weight_binding, async_finish: bool = False):
+        """Prefetch BF16 expert weights through their prepared address table."""
+        binding = weight_binding
+        ctx = self._validate_pointer_binding(binding, plan, dtype=torch.bfloat16)
+        operation = ctx['kernels']['prefetch'].compute_from_ptrs
+        args = (ctx, binding.expert_ptrs, binding.comm_buffer, plan.experts_to_copy)
+
+        if not async_finish:
+            operation(*args)
+            return None
+
+        prev_stream = torch_npu.npu.current_stream()
+        with torch_npu.npu.stream(self._comm_stream):
+            self._comm_stream.wait_stream(prev_stream)
+            operation(*args)
+            self._record_streams(
+                (*binding.expert_views, binding.comm_buffer, binding.comm_buffer_source, binding.expert_ptrs,
+                 plan.experts_to_copy), self._comm_stream)
+        done = self._comm_stream.record_event()
+        return done
+
+    def reduce_grad_to_ptrs(self, plan, grad_binding, async_finish: bool = False):
+        """Accumulate FP32 slot gradients into prepared expert destinations."""
+        binding = grad_binding
+        ctx = self._validate_pointer_binding(binding, plan, dtype=torch.float32)
+        if not async_finish:
+            ctx['kernels']['grad_reduce'].compute_targets(
+                ctx, binding.expert_ptrs, binding.comm_buffer, plan.experts_to_copy,
+                rank=int(ctx['rank']),
+                num_sms=int(ctx['num_sms']))
+            return None
+
+        prev_stream = torch_npu.npu.current_stream()
+        with torch_npu.npu.stream(self._comm_stream):
+            self._comm_stream.wait_stream(prev_stream)
+            ctx['kernels']['grad_reduce'].compute_targets(
+                ctx, binding.expert_ptrs, binding.comm_buffer, plan.experts_to_copy,
+                rank=int(ctx['rank']),
+                num_sms=int(ctx['num_sms']))
+            self._record_streams(
+                (*binding.expert_views, binding.comm_buffer, binding.comm_buffer_source, binding.expert_ptrs,
+                 plan.experts_to_copy, ctx.get('_grad_reduce_target_workspace')),
+                self._comm_stream)
+        done = self._comm_stream.record_event()
+        return done
+
 
     def _run_dispatch_on_current_stream(
         self,
@@ -655,7 +863,6 @@ class Buffer:
         zero_copy: bool,
         router_weights_zero_copy: bool = False,
     ) -> None:
-        stream = torch_npu.npu.current_stream().npu_stream
         if not zero_copy:
             # master-style boundary copy of the hidden shard (same stream).
             ctx['hidden_buf_local'].copy_(hidden_nvsh)
@@ -667,6 +874,9 @@ class Buffer:
         # peer shards.  Keeping this boundary common lets CombineOp own the
         # implementation selection without duplicating Buffer call paths.
         if inter_rank_sync:
+            # Fetch the raw stream after the copies to flush torch_npu's CPU
+            # task queue before enqueueing the SHMEM barrier (upstream PR #14).
+            stream = torch_npu.npu.current_stream().npu_stream
             cross_rank_barrier(ctx, stream)
         # Prologue is folded into moonEP_combine (cf. dispatch_epilogue).
         ctx['kernels']['combine'].compute(
@@ -676,6 +886,59 @@ class Buffer:
             output_sk=route_weights_sk,
             shmem_instance_id=0,
         )
+
+    @staticmethod
+    def _validate_expert_tensors(expert_tensors, comm_buffer, *, dtype, operation, expected_experts):
+        """Host metadata validation only; never materialize a device tensor."""
+        expert_tensors = tuple(expert_tensors)
+        if _C is None:
+            raise RuntimeError(f"{operation} requires the npu_patch native extension")
+        if not isinstance(comm_buffer, torch.Tensor) or comm_buffer.ndim < 2:
+            raise TypeError(f"{operation} comm_buffer must be a [B,...] Tensor")
+        if not comm_buffer.is_contiguous() or comm_buffer.dtype != dtype:
+            raise TypeError(f"{operation} comm_buffer must be contiguous {dtype}")
+        count = expected_experts
+        if type(count) is not int or count <= 0 or len(expert_tensors) != count:
+            raise ValueError(f"{operation} requires exactly {count} local expert references")
+        row_shape = tuple(int(value) for value in comm_buffer.shape[1:])
+        addresses = []
+        ranges = []
+        for index, ref in enumerate(expert_tensors):
+            if not isinstance(ref, torch.Tensor):
+                raise TypeError(f"{operation} reference {index} is not a Tensor")
+            if ref.device != comm_buffer.device:
+                raise RuntimeError(f"{operation} references and slots must share one NPU")
+            if ref.dtype != dtype or not ref.is_contiguous():
+                raise TypeError(f"{operation} references must be contiguous {dtype}")
+            if tuple(int(value) for value in ref.shape) != row_shape:
+                raise ValueError(
+                    f"{operation} reference {index} shape {tuple(ref.shape)} "
+                    f"does not match slot row {row_shape}"
+                )
+            begin = int(ref.data_ptr())
+            end = begin + int(ref.numel()) * int(ref.element_size())
+            addresses.append(begin)
+            ranges.append((begin, end))
+        return addresses, ranges
+
+
+    def _validate_expert_plan(self, plan, comm_buffer, operation):
+        if not isinstance(plan, MoonEPCommPlan):
+            raise TypeError(f"{operation} requires a MoonEPCommPlan")
+        ctx = self._require_ctx()
+        _validate_plan_layout(ctx, plan)
+        experts_to_copy = plan.experts_to_copy
+        if (
+            experts_to_copy.dtype != torch.int32
+            or experts_to_copy.ndim != 2
+            or not experts_to_copy.is_contiguous()
+        ):
+            raise TypeError(f"{operation} plan must contain contiguous INT32 [R,B] experts")
+        if experts_to_copy.device != comm_buffer.device:
+            raise RuntimeError(f"{operation} plan and comm_buffer must share one NPU")
+        if int(experts_to_copy.shape[1]) != int(comm_buffer.shape[0]):
+            raise ValueError(f"{operation} plan B does not match comm_buffer")
+
 
     def _run_prefetch_weight_on_current_stream(
         self,
@@ -836,8 +1099,14 @@ class Buffer:
         into via the peer address), and ``router_weights_zero_copy`` independently
         returns the ``route_weights_nvs`` fp32 view of ``weights_buf_local``
         instead of a fresh copy (default False, matching the CUDA API).
+        Autograd integrations must manage their own Tensor wrappers and saved
+        values before returning these aliases through a custom Function.
+        Input shapes must match S, H and K fixed at Buffer construction.
+        Only plan-defined rows are valid; callers own initialization of unused
+        carrier capacity before including it in downstream computation.
         """
         ctx = self._require_ctx()
+        comm_buffers = getattr(self, '_comm_buffers', None)
         self._ensure_shmem_views()
 
         if plan is None:
@@ -851,7 +1120,10 @@ class Buffer:
         else:
             cu_seqlens = None
             planning_args = None
-            assert isinstance(plan, MoonEPCommPlan)
+            _validate_plan_layout(ctx, plan)
+
+        if comm_buffers is not None:
+            ctx = comm_context(ctx, comm_buffers)
 
         if zero_copy:
             hidden_nvsh = ctx['hidden_buf_local']
@@ -893,6 +1165,8 @@ class Buffer:
             plan.dup_counts,
             *(planning_args or ()),
         )
+        if comm_buffers is not None:
+            tensors += (*comm_buffers.sources, comm_buffers.hidden, comm_buffers.route)
         # First make comm_stream wait for sync work already queued on the
         # current stream (e.g. a preceding dispatch) to drain, then launch
         # async on comm_stream; otherwise the two streams race over the same
@@ -1001,11 +1275,20 @@ class Buffer:
         router_weights_zero_copy: bool = False,
     ):
         """combine fwd: gather expert outputs from the symmetric shard and
-        K-sum back to token-major [S, H]. Also serves as dispatch bwd."""
+        K-sum back to token-major [S, H]. Also serves as dispatch bwd.
+
+        Prepared communication storage is selected with set_comm_buffers().
+        """
         ctx = self._require_ctx()
+        comm_buffers = getattr(self, '_comm_buffers', None)
         self._ensure_shmem_views()
 
         assert isinstance(plan, MoonEPCommPlan), "Buffer.combine: plan is required"
+
+        _validate_plan_layout(ctx, plan)
+
+        if comm_buffers is not None:
+            ctx = comm_context(ctx, comm_buffers)
 
         assert hidden_nvsh is not None
         assert hidden_nvsh.dtype == torch.bfloat16
@@ -1066,6 +1349,8 @@ class Buffer:
             plan.remote_stats, plan.dup_groups, plan.dup_loffs,
             plan.dup_counts,
         )
+        if comm_buffers is not None:
+            tensors += (*comm_buffers.sources, comm_buffers.hidden, comm_buffers.route)
         prev_stream = torch_npu.npu.current_stream()
         with torch_npu.npu.stream(self._comm_stream):
             self._comm_stream.wait_stream(prev_stream)
@@ -1104,6 +1389,7 @@ class Buffer:
         rank's home grads, rows ``[E, E+B)`` are backed by the reduce buffer —
         and each ``*_reduce_buffer`` is the full ``[R, B, H, H']`` fp32 view
         (all R ranks' reduce buffers mapped as one).
+
         """
         projection_grads = (full_gate_grad, full_up_grad, full_down_grad)
         reduce_buffers = (

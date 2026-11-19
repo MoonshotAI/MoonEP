@@ -12,6 +12,7 @@
 #include <torch/script.h>
 
 #include "shmem.h"
+#include "ascend_moonep/kernels/launch.h"
 
 #include "csrc/common/check.h"
 #include "csrc/launcher.h"
@@ -147,7 +148,13 @@ private:
 
 class PrefetchWeight : public torch::jit::CustomClassHolder {
 public:
+
     explicit PrefetchWeight(int64_t /*local_mem_size*/) {}
+    torch::Tensor compute_from_ptrs(torch::Tensor pointers, torch::Tensor slots,
+        torch::Tensor plan, int64_t local_experts, bool use_udma) {
+        return ascend_moonep::ops::LaunchPrefetchPushPointers(
+            pointers, slots, plan, local_experts, use_udma);
+    }
 
     void destroy() {}
 
@@ -201,6 +208,19 @@ public:
             rank,
             blocks,
             use_udma);
+    }
+
+    void compute_targets(
+        torch::Tensor target_ptrs, torch::Tensor reduce_buffers,
+        torch::Tensor experts_to_copy, int64_t epn, int64_t hidden,
+        int64_t projection, int64_t ranks, int64_t slots, int64_t rank,
+        int64_t blocks, bool use_udma = false,
+        c10::optional<torch::Tensor> workspace = c10::nullopt) {
+        TORCH_CHECK(rank == aclshmem_my_pe(),
+                    "rank does not match the active CANN-SHMEM PE");
+        ascend_moonep::ops::GradReduceTargets(target_ptrs, reduce_buffers, experts_to_copy,
+            epn, hidden, projection, ranks, slots, rank, blocks, use_udma,
+            workspace.value_or(torch::Tensor()));
     }
 };
 
@@ -297,7 +317,8 @@ public:
         int64_t num_topk,
         int64_t world_size,
         int64_t rank,
-        bool use_udma) {
+        bool use_udma,
+        int64_t num_sms = 32) {
         TORCH_CHECK(
             rank == aclshmem_my_pe(),
             "rank does not match the active CANN-SHMEM PE");
@@ -316,7 +337,8 @@ public:
             num_topk,
             world_size,
             rank,
-            use_udma);
+            use_udma,
+            num_sms);
     }
 
     void compute_profile(
@@ -377,7 +399,8 @@ public:
         int64_t num_topk,
         int64_t world_size,
         int64_t rank,
-        bool use_udma) {
+        bool use_udma,
+        int64_t num_sms = 32) {
         TORCH_CHECK(
             rank == aclshmem_my_pe(),
             "rank does not match the active CANN-SHMEM PE");
@@ -395,7 +418,8 @@ public:
             num_topk,
             world_size,
             rank,
-            use_udma);
+            use_udma,
+            num_sms);
     }
 };
 
@@ -495,12 +519,20 @@ static auto prefetch_weight_registry =
     torch::jit::class_<ascend_moonep::torch_classes::PrefetchWeight>("AscendMoonEP", "PrefetchWeight")
         .def(torch::jit::init<int64_t>())
         .def("compute", &ascend_moonep::torch_classes::PrefetchWeight::compute)
+        .def("compute_from_ptrs", &ascend_moonep::torch_classes::PrefetchWeight::compute_from_ptrs)
         .def("destroy", &ascend_moonep::torch_classes::PrefetchWeight::destroy);
 
 static auto grad_reduce_registry =
     torch::jit::class_<ascend_moonep::torch_classes::GradReduce>("AscendMoonEP", "GradReduce")
         .def(torch::jit::init<>())
-        .def("compute", &ascend_moonep::torch_classes::GradReduce::compute);
+        .def("compute", &ascend_moonep::torch_classes::GradReduce::compute)
+        .def("compute_targets", &ascend_moonep::torch_classes::GradReduce::compute_targets,
+             "", {torch::arg("target_ptrs"), torch::arg("reduce_buffers"),
+                  torch::arg("experts_to_copy"), torch::arg("epn"),
+                  torch::arg("hidden"), torch::arg("projection"),
+                  torch::arg("ranks"), torch::arg("slots"), torch::arg("rank"),
+                  torch::arg("blocks"), torch::arg("use_udma") = false,
+                  torch::arg("workspace") = c10::IValue()});
 
 static auto planning_registry =
     torch::jit::class_<ascend_moonep::torch_classes::Planning>("AscendMoonEP", "Planning")
@@ -516,13 +548,26 @@ static auto planning_registry =
 static auto dispatch_registry =
     torch::jit::class_<ascend_moonep::torch_classes::Dispatch>("AscendMoonEP", "Dispatch")
         .def(torch::jit::init<>())
-        .def("compute", &ascend_moonep::torch_classes::Dispatch::compute)
+        .def("compute", &ascend_moonep::torch_classes::Dispatch::compute,
+             "", {torch::arg("hidden_sh"), torch::arg("route_weights"),
+                  torch::arg("dst"), torch::arg("dup_groups"), torch::arg("dup_loffs"),
+                  torch::arg("dup_counts"), torch::arg("hidden_buf"),
+                  torch::arg("route_weights_buf"), torch::arg("sync_buffer"),
+                  torch::arg("num_tokens"), torch::arg("hidden_size"), torch::arg("num_topk"),
+                  torch::arg("world_size"), torch::arg("rank"), torch::arg("use_udma"),
+                  torch::arg("num_sms") = 32})
         .def("compute_profile", &ascend_moonep::torch_classes::Dispatch::compute_profile);
 
 static auto combine_registry =
     torch::jit::class_<ascend_moonep::torch_classes::Combine>("AscendMoonEP", "Combine")
         .def(torch::jit::init<>())
-        .def("compute", &ascend_moonep::torch_classes::Combine::compute);
+        .def("compute", &ascend_moonep::torch_classes::Combine::compute,
+             "", {torch::arg("hidden_buf"), torch::arg("weight_buf"),
+                  torch::arg("dst"), torch::arg("dup_groups"), torch::arg("dup_loffs"),
+                  torch::arg("dup_counts"), torch::arg("hidden_sk_out"),
+                  torch::arg("route_weights_sk_out"), torch::arg("num_tokens"),
+                  torch::arg("hidden_size"), torch::arg("num_topk"), torch::arg("world_size"),
+                  torch::arg("rank"), torch::arg("use_udma"), torch::arg("num_sms") = 32});
 
 static auto combine_urma_registry =
     torch::jit::class_<ascend_moonep::torch_classes::CombineUrma>("AscendMoonEP", "CombineUrma")

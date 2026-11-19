@@ -139,12 +139,16 @@ include("${CMAKE_SOURCE_DIR}/cmake/AscendMoonEPKernel.cmake")
 ascend_moonep_add_kernel_library(
     ascend_moonep_kernels
     SOURCES
+        kernels/prefetch_pointer_push_mte.cpp
+        kernels/barrier_all.cpp
         kernels/barrier_bench.cpp
         kernels/moonep_combine.cpp
         kernels/moonep_dispatch.cpp
         kernels/moonep_grad_reduce.cpp
         ${ASCEND_MOONEP_PLANNING_KERNEL_SOURCE}
         kernels/prefetch.cpp
+        # These translation units provide unavailable stubs on A2/A3.
+        kernels/prefetch_pointer_push_udma.cpp
         ${ASCEND_MOONEP_UDMA_KERNEL_SOURCES}
     INCLUDES
         include

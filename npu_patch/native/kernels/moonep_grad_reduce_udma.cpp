@@ -65,7 +65,8 @@ void MoonEPShmemGradReduceUdmaFused(
     int32_t projection,
     int32_t ranks,
     int32_t slots,
-    int32_t rank)
+    int32_t rank,
+    bool pointer_targets)
 {
     util_set_ffts_config(ffts_addr);
 
@@ -74,6 +75,7 @@ void MoonEPShmemGradReduceUdmaFused(
     const int64_t matrix = static_cast<int64_t>(hidden) * projection;
 
     auto* grads = reinterpret_cast<__gm__ float*>(expert_grads_addr);
+    auto* target_ptrs = reinterpret_cast<__gm__ uint64_t*>(expert_grads_addr);
     auto* reduce = reinterpret_cast<__gm__ float*>(reduce_buffers_addr);
     auto* plan = reinterpret_cast<__gm__ int32_t*>(experts_to_copy_addr);
     auto* workspace = reinterpret_cast<__gm__ float*>(workspace_addr) + coreIdx * OUTER_LOOP_SIZE;
@@ -101,6 +103,12 @@ void MoonEPShmemGradReduceUdmaFused(
             if (dstRankIdx != rank) {
                 continue;
             }
+            // Adapt each canonical allocation as a one-expert dense view,
+            // just like the MTE kernel; leave the reduction itself unchanged.
+            auto* accum_grads = pointer_targets ?
+                reinterpret_cast<__gm__ float*>(target_ptrs[dstExpertIdx]) :
+                grads;
+            const int32_t accum_local_expert = pointer_targets ? 0 : dstExpertIdx;
 
             for (int64_t slotOffset = 0; slotOffset < matrix; slotOffset += OUTER_LOOP_SIZE)
             {
@@ -108,22 +116,19 @@ void MoonEPShmemGradReduceUdmaFused(
                 if (srcRankIdx != dstRankIdx) {
                     aclshmemx_udma_get_nbi((__gm__ uint8_t*)(workspace), (__gm__ uint8_t*)(reduce + srcSlotIdx * matrix + slotOffset), wqe_scratch, loopSize * sizeof(float), srcRankIdx, 0);
                     aclshmemx_udma_quiet(srcRankIdx);
-                    ComputeSingle(grads + dstExpertIdx * matrix + slotOffset, workspace, ubLocal, loopSize);
+                    ComputeSingle(accum_grads + accum_local_expert * matrix + slotOffset, workspace, ubLocal, loopSize);
                 } else {
-                    ComputeSingle(grads + dstExpertIdx * matrix + slotOffset, reduce + srcSlotIdx * matrix + slotOffset, ubLocal, loopSize);
+                    ComputeSingle(accum_grads + accum_local_expert * matrix + slotOffset, reduce + srcSlotIdx * matrix + slotOffset, ubLocal, loopSize);
                 }
             }
         }
     }
 
-    // Every remote GET was already completed by its owning AIV via
-    // aclshmemx_udma_quiet. Do NOT use aclshmem_quiet() here: it drains every
-    // peer from every AIV, and SHMEM requires UDMA queue-state mutation
-    // (submit/quiet/poll) to be serialized per jetty. Only the local MTE3
-    // atomic-add stores still need draining.
+    // Each remote GET is completed by its owning AIV above. Preserve the
+    // dev_npu fix: generic quiet would race UDMA queue state across AIVs.
     aclshmemx_mte_quiet();
+    // Preserve dense completion for both address contracts. Idle AIVs join too.
     aclshmemx_barrier_all_vec();
-
     if (coreIdx == 0) {
         GlobalTensor<float> reduceGm_;
         reduceGm_.SetGlobalBuffer(reduce);
@@ -135,7 +140,7 @@ void MoonEPShmemGradReduceUdmaFused(
     }
 }
 
-extern "C" ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce_udma(
+static int LaunchGradReduceUdma(
     void* stream,
     void* expert_grads,
     void* reduce_buffers,
@@ -147,7 +152,8 @@ extern "C" ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce_udma(
     int32_t ranks,
     int32_t slots,
     int32_t rank,
-    int32_t blocks)
+    int32_t blocks,
+    bool pointer_targets)
 {
     if (stream == nullptr || expert_grads == nullptr ||
         reduce_buffers == nullptr || experts_to_copy == nullptr ||
@@ -157,7 +163,15 @@ extern "C" ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce_udma(
         return ACL_ERROR_INVALID_PARAM;
     }
 
-    (void)aclrtGetLastError(ACL_RT_THREAD_LEVEL);
+    if (pointer_targets) {
+        // Preserve an existing error instead of erasing the first failure.
+        const auto status = aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
+        if (status != ACL_SUCCESS) {
+            return status;
+        }
+    } else {
+        (void)aclrtGetLastError(ACL_RT_THREAD_LEVEL);
+    }
     const int32_t shmem_ranks = aclshmem_n_pes();
     if (shmem_ranks <= 0 || ranks != shmem_ranks) {
         return ACL_ERROR_INVALID_PARAM;
@@ -165,15 +179,31 @@ extern "C" ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce_udma(
 
     MoonEPShmemGradReduceUdmaFused<<<blocks, nullptr, stream>>>(
         shmemx_get_ffts_config(),
-        reinterpret_cast<std::uint8_t*>(expert_grads),
-        reinterpret_cast<std::uint8_t*>(reduce_buffers),
-        reinterpret_cast<std::uint8_t*>(workspace),
-        reinterpret_cast<std::uint8_t*>(const_cast<int32_t*>(experts_to_copy)),
-        epn,
-        hidden,
-        projection,
-        ranks,
-        slots,
-        rank);
+        reinterpret_cast<uint8_t*>(expert_grads),
+        reinterpret_cast<uint8_t*>(reduce_buffers),
+        reinterpret_cast<uint8_t*>(workspace),
+        reinterpret_cast<uint8_t*>(const_cast<int32_t*>(experts_to_copy)),
+        epn, hidden, projection, ranks, slots, rank, pointer_targets);
+
     return aclrtPeekAtLastError(ACL_RT_THREAD_LEVEL);
+}
+
+extern "C" ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce_udma(
+    void* stream, void* expert_grads, void* reduce_buffers, void* workspace,
+    const int32_t* experts_to_copy, int32_t epn, int32_t hidden,
+    int32_t projection, int32_t ranks, int32_t slots, int32_t rank,
+    int32_t blocks)
+{
+    return LaunchGradReduceUdma(stream, expert_grads, reduce_buffers, workspace,
+        experts_to_copy, epn, hidden, projection, ranks, slots, rank, blocks, false);
+}
+
+extern "C" ASCEND_MOONEP_EXPORT int moonep_shmem_grad_reduce_targets_udma(
+    void* stream, void* target_ptrs, void* reduce_buffers, void* workspace,
+    const int32_t* experts_to_copy, int32_t epn, int32_t hidden,
+    int32_t projection, int32_t ranks, int32_t slots, int32_t rank,
+    int32_t blocks)
+{
+    return LaunchGradReduceUdma(stream, target_ptrs, reduce_buffers, workspace,
+        experts_to_copy, epn, hidden, projection, ranks, slots, rank, blocks, true);
 }

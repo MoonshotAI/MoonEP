@@ -132,9 +132,12 @@ def _load_buffer_api():
     from .shmem_runtime import ShmemRuntime, runtime_library_info
     from .planning import MoonEPCommPlan
     from .api import Buffer
+    from .buffer_bindings import CommBuffers, ExpertPointerBinding
 
     return {
         "Buffer": Buffer,
+        "CommBuffers": CommBuffers,
+        "ExpertPointerBinding": ExpertPointerBinding,
         "MoonEPCommPlan": MoonEPCommPlan,
         "ShmemRuntime": ShmemRuntime,
         "runtime_library_info": runtime_library_info,
@@ -142,7 +145,7 @@ def _load_buffer_api():
 
 
 _BUFFER_API_NAMES = frozenset({
-    "Buffer", "MoonEPCommPlan", "ShmemRuntime", "runtime_library_info"
+    "Buffer", "CommBuffers", "ExpertPointerBinding", "MoonEPCommPlan", "ShmemRuntime", "runtime_library_info"
 })
 _BUF_API_CACHE = None
 
@@ -156,16 +159,20 @@ def __getattr__(name):
     raise AttributeError(f"module 'npu_patch' has no attribute {name!r}")
 
 
-from .launchers import launch_grad_reduce, launch_prefetch
+from .launchers import launch_grad_reduce, launch_grad_reduce_targets, launch_prefetch, launch_prefetch_from_ptrs
 
 __all__ = [
     "ShmemInstance",
     "GradReduce",
     "launch_grad_reduce",
+    "launch_grad_reduce_targets",
     "Buffer",
+    "CommBuffers",
+    "ExpertPointerBinding",
     "MoonEPCommPlan",
     "ShmemRuntime",
     "runtime_library_info",
     "PrefetchWeight",
     "launch_prefetch",
+    "launch_prefetch_from_ptrs",
 ]

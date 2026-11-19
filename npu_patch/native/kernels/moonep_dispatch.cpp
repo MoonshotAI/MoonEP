@@ -2,7 +2,7 @@
 // UBMEM implementation — uses SHMEM symmetric window and DataCopyPad + UB/MTE.
 // No URMA/UDMA, no zero-fill.
 //
-// Architecture: A2/A5, fixed kMoonEPAivNum AIV cores.
+// Architecture: A2/A5, AIV launch width controlled by num_sms.
 //
 // Single-kernel design:
 //   Phase 1 (Scatter): cores split routed slots N=S*K.
@@ -19,7 +19,6 @@
 using namespace AscendC;
 
 using bf16_t = bfloat16_t;
-using ascend_moonep::kMoonEPAivNum;
 
 // UB buffer sizing: one bf16 hidden row, weight ping-pong, and route metadata.
 // Safety margin: allocate up to 128KB for hidden row (H <= 65536).
@@ -614,6 +613,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void moonep_dispa
     uint32_t with_weights = tiling.with_weights;
 
     uint32_t core_idx = get_block_idx();
+    uint32_t core_count = get_block_num();
 
     LocalTensor<uint8_t> ub_base;
     ub_base.address_.logicPos = static_cast<uint8_t>(TPosition::VECIN);
@@ -631,7 +631,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void moonep_dispa
         hidden_buf_gm, route_weights_buf_gm,
         S, H, K, tiling.R, NvS,
         with_weights != 0,
-        core_idx, kMoonEPAivNum);
+        core_idx, core_count);
 
     // The scatter above issues aclshmemx_mte_put_nbi, and sync_vec (behind
     // aclshmemx_barrier_all_vec) does not complete outstanding NBI communication.
@@ -644,7 +644,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void moonep_dispa
 
     PlanEpiloguePhase<bf16_t>(
         ub_base, hbuf, dgrp, dloff, dcnt,
-        H, NvS, core_idx, kMoonEPAivNum);
+        H, NvS, core_idx, core_count);
 }
 
 
@@ -667,7 +667,7 @@ void moonep_dispatch_kernel_do(
 {
     auto* td = reinterpret_cast<ascend_moonep::MoonEPDispatchTilingData*>(tiling_host);
 
-    moonep_dispatch_kernel<<<kMoonEPAivNum, nullptr, stream>>>(
+    moonep_dispatch_kernel<<<td->block_dim, nullptr, stream>>>(
         hidden_sh,
         route_weights,
         dst,
