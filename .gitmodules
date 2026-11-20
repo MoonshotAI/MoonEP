@@ -1,0 +1,8 @@
+[submodule "npu_patch/3rdparty/shmem"]
+	path = npu_patch/3rdparty/shmem
+	url = https://gitcode.com/cann/shmem.git
+	branch = master
+[submodule "npu_patch/3rdparty/catlass"]
+	path = npu_patch/3rdparty/catlass
+	url = https://gitcode.com/cann/catlass.git
+	branch = master

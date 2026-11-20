@@ -7,20 +7,35 @@ import tempfile
 import torch
 import torch.distributed as dist
 
-from moonep._C import (
-    FABRIC_HANDLE_BYTES as _FABRIC_HANDLE_BYTES,
-    nvl_dist_alloc,
-    nvl_dist_map,
-    nvl_fabric_supported,
-    nvl_release_mem_handle,
-    get_vmm_granularity,
-    get_multicast_granularity,
-    nvl_multicast_supported,
-    nvl_multicast_create,
-    nvl_multicast_import,
-    nvl_multicast_add_device,
-    nvl_multicast_bind_map,
-)
+from moonep import _backend as _backend
+
+# Backend switch: default is GPU. Only the NPU path skips importing the CUDA
+# `_C` extension (which cannot load on a non-CUDA device). On GPU this import
+# runs untouched, so the NVLink path below is byte-for-byte identical.
+_NPU = _backend.npu_enabled()
+if not _NPU:
+    from moonep._C import (
+        FABRIC_HANDLE_BYTES as _FABRIC_HANDLE_BYTES,
+        nvl_dist_alloc,
+        nvl_dist_map,
+        nvl_fabric_supported,
+        nvl_release_mem_handle,
+        get_vmm_granularity,
+        get_multicast_granularity,
+        nvl_multicast_supported,
+        nvl_multicast_create,
+        nvl_multicast_import,
+        nvl_multicast_add_device,
+        nvl_multicast_bind_map,
+    )
+else:
+    _FABRIC_HANDLE_BYTES = None
+    nvl_dist_alloc = nvl_dist_map = nvl_fabric_supported = None
+    nvl_release_mem_handle = get_vmm_granularity = \
+        get_multicast_granularity = None
+    nvl_multicast_supported = nvl_multicast_create = \
+        nvl_multicast_import = None
+    nvl_multicast_add_device = nvl_multicast_bind_map = None
 
 # How VMM allocations are shared between the ranks of an EP group. "auto" (the
 # default) picks fabric handles when the group spans more than one node and the
@@ -408,3 +423,27 @@ def create_nvl_single_owner_tensor(
     if is_owner:
         tensor._keepalive = keepalive
     return tensor
+
+
+# ---------------------------------------------------------------------------
+# NPU backend binding.
+#
+# `moonep._npu_buffer` provides the weight/grad pool builders, the cross-rank
+# point-visit accessors and the shmem teardown helper — names that have no GPU
+# counterpart here at all (a GPU test builds those tensors with plain
+# `torch.empty` slices). This block only re-exports them, so callers reach all of
+# them through `moonep.buffer`; the import stays behind `_NPU`, so a GPU process
+# never loads `torch_npu` / `npu_patch`. It sits at the bottom of the module
+# purely to keep every NPU re-export in one place.
+# ---------------------------------------------------------------------------
+if _NPU:  # pragma: no cover - exercised only on Ascend hardware
+    from moonep._npu_buffer import (
+        create_full_grad_and_reduce_buffer,
+        create_full_weight,
+        expert_pool_row,
+        projection_home_slice,
+        projection_slot_slice,
+        read_reduce_slot,
+        release_owned,
+        remote_home_rows,
+    )
