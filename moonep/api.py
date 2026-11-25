@@ -780,6 +780,31 @@ class Buffer:
             assert topk_flat.dtype == torch.int32 and topk_flat.numel() == int(ctx['N'])
             assert tokens_per_expert.dtype == torch.int32
             assert tokens_per_expert.numel() == int(ctx['E']) and tokens_per_expert.is_contiguous()
+            if __debug__ and os.environ.get("MOONEP_DEBUG_ASSERT_ROUTING", "0") == "1":
+                # Planning reserves padded row blocks from tokens_per_expert,
+                # while dispatch writes rows derived from topk_experts.  The
+                # planner cannot see an over-declared expert, so a mismatch
+                # silently leaves stale rows in the dispatch buffer.
+                E = int(ctx['E'])
+                topk_cpu = topk_flat.detach().to(device="cpu", dtype=torch.int64)
+                if bool(((topk_cpu < 0) | (topk_cpu >= E)).any().item()):
+                    raise AssertionError(f"topk_experts entries must be in [0, {E})")
+                histogram = torch.bincount(topk_cpu, minlength=E)
+                declared = tokens_per_expert.detach().to(
+                    device="cpu", dtype=torch.int64
+                )
+                if not torch.equal(histogram, declared):
+                    mismatch = torch.nonzero(
+                        histogram != declared, as_tuple=False
+                    ).flatten()
+                    raise AssertionError(
+                        "tokens_per_expert must equal bincount(topk_experts); "
+                        f"experts={mismatch[:8].tolist()}, "
+                        f"actual={histogram[mismatch[:8]].tolist()}, "
+                        f"declared={declared[mismatch[:8]].tolist()}. "
+                        "Planning zero-fills only declared padding rows, so a "
+                        "mismatch leaves stale rows in the dispatch buffer."
+                    )
             plan, cu_seqlens = allocate_planning_outputs(ctx)
             planning_args = (topk_flat, tokens_per_expert, cu_seqlens)
         else:
